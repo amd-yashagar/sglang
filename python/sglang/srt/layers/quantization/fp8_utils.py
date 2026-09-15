@@ -376,6 +376,7 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
+    AITER = "aiter"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -395,6 +396,9 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_gfx95_dot_scaled(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
+    def is_aiter(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.AITER
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -636,6 +640,14 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.DEEP_GEMM
 
+    if backend.is_aiter():
+        if not (_use_aiter and _is_hip and _is_gfx95_supported):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=aiter, "
+                "but that path requires ROCm gfx950 with SGLANG_USE_AITER=1."
+            )
+        return Mxfp8DenseGemmBackend.AITER
+
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
@@ -668,6 +680,12 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+    elif backend.is_aiter():
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            flydsl_mxfp8_blockscaled_linear,
+        )
+
+        return flydsl_mxfp8_blockscaled_linear
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
