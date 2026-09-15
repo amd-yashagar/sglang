@@ -128,6 +128,13 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_fake_topk_slot() -> bool:
+    from aiter.fused_moe import fused_moe
+
+    return "has_fake_topk_slot" in inspect.signature(fused_moe).parameters
+
+
 _RECV_BOUND_LOGGED: set[int] = set()
 _RECV_BOUND_WARNED = False
 
@@ -233,6 +240,14 @@ class AiterRunnerCore(MoeRunnerCore):
                 "not accept a `no_combine` kwarg. Install an aiter build that "
                 "supports fused_moe no_combine output."
             )
+        if (
+            quant_info.expert_mask is not None
+            and not _aiter_fused_moe_supports_fake_topk_slot()
+        ):
+            raise NotImplementedError(
+                "expert_mask was provided but the installed aiter.fused_moe does "
+                "not accept a `has_fake_topk_slot` kwarg."
+            )
 
         if runner_input.hidden_states.shape[0] == 0:
             if self.config.no_combine:
@@ -262,6 +277,17 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        is_gated_swiglu = (
+            self.config.activation != "situ" and self.config.gemm1_alpha is not None
+        )
+        effective_swiglu_limit = quant_info.swiglu_limit
+        if is_gated_swiglu and not effective_swiglu_limit:
+            effective_swiglu_limit = self.config.gemm1_clamp_limit or 0.0
+        activation = (
+            _aiter_activation("swiglu")
+            if is_gated_swiglu
+            else _aiter_activation(self.config.activation)
+        )
         if self.config.activation == "situ":
             from aiter.ops.flydsl.moe_common import GateMode
 
@@ -270,7 +296,7 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
-        elif quant_info.swiglu_limit > 0:
+        elif effective_swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
@@ -282,14 +308,22 @@ class AiterRunnerCore(MoeRunnerCore):
             # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
             # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
+            requires_mxfp8_interleave = (
+                quant_info.quant_type == AiterQuantType.PER_1X32
+                and quant_info.w13_weight.dtype == torch.float8_e4m3fn
+            )
             extra["gate_mode"] = (
                 GateMode.INTERLEAVE.value
-                if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                if (
+                    requires_mxfp8_interleave or envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                )
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            extra["swiglu_limit"] = effective_swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+        if quant_info.expert_mask is not None:
+            extra["has_fake_topk_slot"] = False
 
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
@@ -298,7 +332,7 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=activation,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
