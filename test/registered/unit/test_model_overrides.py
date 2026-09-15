@@ -2563,10 +2563,25 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online", moe_runner_backend="triton")
                 )
-        self.assertEqual(
-            _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
-            {"moe_runner_backend": "flashinfer_trtllm"},
-        )
+        with override_platform(is_hip=False):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+        with (
+            override_platform(is_hip=True),
+            patch.object(overrides_module, "is_gfx95_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(
+                    _view(quantization="mxfp8", moe_runner_backend="aiter")
+                ),
+                {},
+            )
+            self.assertEqual(
+                _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
+                {"moe_runner_backend": "triton"},
+            )
         with override_platform(is_sm120=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(

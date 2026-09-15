@@ -1540,7 +1540,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
-            allowed.append("triton")
+            allowed.extend(("triton", "aiter"))
 
         if view.moe_a2a_backend == "flashinfer_megamoe":
             mxfp8_default = "flashinfer_megamoe"
