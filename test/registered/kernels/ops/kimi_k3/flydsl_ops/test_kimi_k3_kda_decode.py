@@ -13,7 +13,6 @@ import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
@@ -27,7 +26,7 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
-    if not torch.cuda.is_available() or not is_flydsl_available():
+    if not torch.cuda.is_available():
         return False
     try:
         return get_gfx() == "gfx950"
@@ -64,7 +63,11 @@ class Inputs:
     norm_weight: torch.Tensor
 
 
-def _make_inputs(batch: int, seed: int = 20260728) -> Inputs:
+def _make_inputs(
+    batch: int,
+    seed: int = 20260728,
+    state_dtype: torch.dtype = torch.float32,
+) -> Inputs:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + batch)
     slots = batch + 2
 
@@ -99,6 +102,8 @@ def _make_inputs(batch: int, seed: int = 20260728) -> Inputs:
         device=_DEVICE,
         generator=generator,
     )
+    if state_dtype != torch.float32:
+        state_storage = state_storage.to(state_dtype)
     state = state_storage[:, : _HEADS * _DIM * _DIM].view(slots, _HEADS, _DIM, _DIM)
 
     raw_beta_storage = torch.randn(
@@ -297,6 +302,7 @@ def _run(inputs: Inputs) -> torch.Tensor:
 def _make_fb_inputs(
     batch: int,
     seed: int = 20260728,
+    state_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, Inputs]:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + 10_000 + batch)
     f_a_storage = torch.randn(
@@ -315,7 +321,7 @@ def _make_fb_inputs(
             generator=generator,
         )
     ).to(torch.bfloat16)
-    inputs = _make_inputs(batch, seed)
+    inputs = _make_inputs(batch, seed, state_dtype=state_dtype)
     projected = F.linear(
         f_a.float(),
         f_b_weight.view(_HEADS * _DIM, _DIM).float(),
@@ -383,8 +389,11 @@ def test_f_b_batch_two_dispatch_is_guarded() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
-    seed = _make_inputs(batch)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kimi_k3_kda_decode_matches_reference(
+    batch: int, state_dtype: torch.dtype
+) -> None:
+    seed = _make_inputs(batch, state_dtype=state_dtype)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
 
@@ -423,8 +432,11 @@ def test_non_positive_slots_do_not_modify_caches() -> None:
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
-    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kimi_k3_kda_decode_with_f_b_matches_reference(
+    batch: int, state_dtype: torch.dtype
+) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(batch, state_dtype=state_dtype)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
 
@@ -438,8 +450,11 @@ def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
-    f_a, f_b_weight, seed = _make_fb_inputs(batch=2)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence(
+    state_dtype: torch.dtype,
+) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(batch=2, state_dtype=state_dtype)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
     for _ in range(32):
@@ -451,9 +466,13 @@ def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
-def test_kimi_k3_kda_decode_with_f_b_graph_replay() -> None:
-    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
-    out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
+@pytest.mark.parametrize("batch", [1, 2, 8, 16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kimi_k3_kda_decode_with_f_b_graph_replay(
+    batch: int, state_dtype: torch.dtype
+) -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=batch, state_dtype=state_dtype)
+    out = torch.empty((1, batch, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
     _run_with_f_b(f_a, f_b_weight, inputs)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -513,6 +532,14 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
     inputs.x = inputs.x.unsqueeze(0)
 
     with pytest.raises(ValueError, match="`x` must have rank 2"):
+        _run(inputs)
+
+
+def test_decode_api_rejects_fp16_state() -> None:
+    inputs = _make_inputs(batch=1)
+    inputs.state = inputs.state.to(torch.float16)
+
+    with pytest.raises(ValueError, match="torch.float32 or torch.bfloat16"):
         _run(inputs)
 
 

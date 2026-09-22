@@ -821,6 +821,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "extend_prefix_lens cannot be None in non-TARGET_VERIFY mode."
             )
         has_initial_state = forward_batch.extend_prefix_lens > 0
+        if has_initial_state.dtype != torch.bool:
+            has_initial_state = has_initial_state.to(torch.bool)
 
         physical_num_tokens = mixed_qkv.shape[0]
         logical_num_tokens = self.forward_metadata.logical_num_tokens
