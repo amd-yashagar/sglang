@@ -526,6 +526,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        # Same AITER dispatch as apply(). Without this, fused o_proj
+        # (output_tensor=...) skipped tgemm and always ran torch.mm / hipBLASLt
+        # even when SGLANG_USE_AITER=1 and a tuned flydsl/opus/asm/triton row
+        # exists for the shape.
+        if _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if x.ndim != 2:
+                raise ValueError(
+                    "caller-owned linear output currently requires a 2D input"
+                )
+            if output.shape != (x.shape[0], layer.weight.shape[0]):
+                raise ValueError(
+                    f"linear output has shape {output.shape}, expected "
+                    f"{(x.shape[0], layer.weight.shape[0])}"
+                )
+            y = tgemm.mm(x, layer.weight, bias, otype=output.dtype)
+            if y.data_ptr() != output.data_ptr():
+                output.copy_(y)
+            return output
         if (
             _enable_bf16_splitk_gemm
             and bias is None

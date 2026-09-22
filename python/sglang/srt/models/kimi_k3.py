@@ -189,10 +189,23 @@ def _k3_bf16_gemm(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
-    through UnquantizedLinearMethod. The fused MoE front and the deferred
-    shared down GEMM call torch directly on raw merged weights, so the
-    --bf16-gemm-backend cutedsl selection would silently skip them."""
+    """Same backend order as UnquantizedLinearMethod.apply for fused-front
+    and shared-down GEMMs that call torch on raw merged weights.
+
+    HIP + SGLANG_USE_AITER uses aiter.tuned_gemm (flydsl/opus/asm/triton
+    from kimik3_bf16_tuned_gemm.csv). Without that, F.linear lands on
+    hipBLASLt Cijk_* even when AITER already has a faster kernel.
+    """
+    otype = out_dtype if out_dtype is not None else (out.dtype if out is not None else x.dtype)
+    weight_data = weight.data if type(weight) is not torch.Tensor else weight
+    if _is_hip and envs.SGLANG_USE_AITER.get() and type(weight_data) is torch.Tensor:
+        from aiter.tuned_gemm import tgemm
+
+        y = tgemm.mm(x, weight_data, None, otype=otype)
+        if out is None:
+            return y
+        out.copy_(y)
+        return out
     if out is None and out_dtype is not None and out_dtype != x.dtype:
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
