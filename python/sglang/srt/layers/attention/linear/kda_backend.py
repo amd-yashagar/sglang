@@ -736,11 +736,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             conv_state_indices=cache_indices,
         )
 
-        # The packed kernel assumes one token per request.
-        if (
-            self.kernel_dispatcher.supports_packed_decode
-            and getattr(layer, "lower_bound", None) is None
-        ):
+        # The packed kernel assumes one token per request. Kimi-K3 always has
+        # a safe-gate lower_bound; the Triton packed kernel implements that
+        # gate (USE_LOWER_BOUND). Skipping packed here forced decode onto
+        # fused_sigmoid_gating_delta_rule_update, whose varlen T-loop reads
+        # query_start_loc. HIP graph replay fills padded cu_seqlens so T=0,
+        # which used to leave those KDA output rows uninitialized and leak
+        # into MoE (GSM8K 0%/89% by concurrency with graphs on, fusion off).
+        if self.kernel_dispatcher.supports_packed_decode:
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."

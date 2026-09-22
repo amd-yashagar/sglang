@@ -154,6 +154,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    # Graph replay pads by collapsing padded cu_seqlens so T=0. Those rows
+    # must still write a defined output: o is allocated with new_empty and
+    # otherwise keeps capture-time / previous-step garbage that then enters MoE.
+    if T <= 0:
+        tl.store(
+            p_o,
+            tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty),
+            mask=mask_v,
+        )
+        return
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
         # Slot stride comes from the caller (h0_source.stride(0)): the state pool
