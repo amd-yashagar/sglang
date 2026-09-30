@@ -128,7 +128,6 @@ from sglang.srt.utils import is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
-    get_bool_env_var,
     rank0_log,
     require_mlp_sync,
     set_weight_attrs,
@@ -141,7 +140,33 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+# Aiter stage-1 fused MX quant reads each token once below this many
+# top-k-expanded rows (8*256/topk). Above it, quant is a separate contiguous pass.
+_AITER_STAGE1_FUSED_QUANT_ROWS = 8 * 256
+
+
+def _routed_slice_aiter_quant_ready(
+    routed_input: torch.Tensor, num_tokens: int, topk: int
+) -> bool:
+    """Whether Aiter's fused stage-1 MX quant can read this latent view.
+
+    The kernel vector-loads 16 bytes from ``input + token * stride``. That
+    holds when the slice pointer and the row stride are 16-byte aligned and
+    the token count stays inside the fused cutoff. The column offset of the
+    latent piece inside the fused-front row is the pointer check.
+    """
+    if topk <= 0 or routed_input.dtype != torch.bfloat16:
+        return False
+    if routed_input.ndim != 2 or routed_input.stride(-1) != 1:
+        return False
+    if num_tokens <= 0 or num_tokens * topk > _AITER_STAGE1_FUSED_QUANT_ROWS:
+        return False
+    elem = routed_input.element_size()
+    if routed_input.data_ptr() % 16 != 0:
+        return False
+    if routed_input.stride(-2) * elem % 16 != 0:
+        return False
+    return True
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -1344,9 +1369,15 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-            router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        # The split keeps stride(-1) == 1. Aiter grouped topk and the fused
+        # gate both load scores through that row stride.
+        if self._moe_front_needs_dense_bf16 and not (
+            _is_hip
+            and envs.SGLANG_USE_AITER.get()
+            and _routed_slice_aiter_quant_ready(
+                routed_input, num_tokens, self.topk.topk_config.top_k
+            )
+        ):
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
