@@ -9,6 +9,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -334,6 +335,17 @@ def rocm_absorb_v_bmm(
     return attn_bmm_output
 
 
+def _aiter_fused_mla_supports_nope() -> bool:
+    """True when this Aiter build can cat and cache without applying RoPE."""
+    try:
+        from aiter.ops.triton.fusions.fused_kv_cache import (
+            fused_qk_rope_cat_and_cache_mla as fused_mla,
+        )
+    except Exception:
+        return False
+    return "apply_rope" in inspect.signature(fused_mla).parameters
+
+
 def _fused_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -361,6 +373,21 @@ def _fused_rope_cat_and_cache(
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.
     out_cache_loc = out_cache_loc.contiguous()
+    if attn.rotary_emb is None:
+        # NoPE (Kimi-K3): the kernel copies the position half and still cats,
+        # casts, and writes the cache. pos/cos/sin stay empty.
+        pos = cos = sin = None
+        is_neox = False
+        apply_rope = False
+    else:
+        pos = positions
+        cos = attn.rotary_emb.cos_cache
+        sin = attn.rotary_emb.sin_cache
+        is_neox = attn.rotary_emb.is_neox_style
+        apply_rope = True
+    # Pass the flag only for NoPE. RoPE keeps the original call so an Aiter
+    # build without apply_rope still runs.
+    rope_kwargs = {} if apply_rope else {"apply_rope": False}
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -368,12 +395,13 @@ def _fused_rope_cat_and_cache(
         k_pe,
         kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
         out_cache_loc,
-        positions,
-        attn.rotary_emb.cos_cache,
-        attn.rotary_emb.sin_cache,
+        pos,
+        cos,
+        sin,
         attn.attn_mqa.k_scale,
-        attn.rotary_emb.is_neox_style,
+        is_neox,
         q_out_dtype=q_out_dtype,
+        **rope_kwargs,
     )
 
 
@@ -916,7 +944,9 @@ class DeepseekMLARocmForwardMixin:
             )
         else:
             if self._skip_rope_for_aiter_fused_mla():
-                q, _, _, k = _fused_rope_cat_and_cache(
+                # Third return is the copied position half. The fourth is a
+                # zeros buffer and is not a key. Prefix-free extend reads k.
+                q, _, k_pe_out, _ = _fused_rope_cat_and_cache(
                     self,
                     q_nope_out,
                     q_pe,
@@ -925,6 +955,7 @@ class DeepseekMLARocmForwardMixin:
                     positions,
                     forward_batch.out_cache_loc,
                 )
+                k = torch.cat([k_nope, k_pe_out], dim=-1)
                 save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
@@ -1058,14 +1089,10 @@ class DeepseekMLARocmForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
 
-        A layer without a rotary_emb has nothing to fuse: that branch reads
-        rotary_emb.cos_cache, so skipping the standalone rope there ends in
-        AttributeError on None. Kimi-K3 has such layers.
+        NoPE layers (rotary_emb is None, Kimi-K3) take the same kernel with
+        apply_rope=False. An Aiter build that has no apply_rope argument stays
+        on the plain cat / cast / scatter path.
         """
-        # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
-        # fused kernel to apply; keep both prepare and core on the plain path.
-        return (
-            _use_aiter_gfx95
-            and self.current_attention_backend == "aiter"
-            and self.rotary_emb is not None
-        )
+        if self.rotary_emb is None and not _aiter_fused_mla_supports_nope():
+            return False
+        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
