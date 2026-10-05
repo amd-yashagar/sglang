@@ -128,7 +128,6 @@ from sglang.srt.utils import is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
-    get_bool_env_var,
     rank0_log,
     require_mlp_sync,
     set_weight_attrs,
@@ -141,7 +140,6 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -1344,8 +1342,8 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-            router_logits = router_logits.contiguous()
+        # The split keeps stride(-1) == 1. Aiter grouped topk and the fused
+        # gate both load scores through that row stride.
         if self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
