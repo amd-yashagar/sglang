@@ -61,6 +61,7 @@ from sglang.kernels.ops.moe.k3_mono_flydsl.common.ops import (
     CM_DEV,
     ballot,
     bf16_round,
+    bf2_f32,
     bf_hi,
     bf_lo,
     block_excl_scan,
@@ -150,7 +151,8 @@ W2_STEPS = RI // 128  # 3
 DOWN_TASKS = LAT // ROWS  # 224
 DOWN_BATCH = 5  # a wave's experts whose w2 is in flight together
 MAX_U = 8 * TOPK
-TL_POINTS = 8  # start, early, sdown, ug, down, lnorm, up, reduce
+# start, early, route_h, load_route, load_latq, ug, down, lnorm, up, reduce
+TL_POINTS = 10
 
 _STREAM = fx.Stream(None)
 
@@ -171,6 +173,10 @@ class MoeBuild:
     # SGLang's Mxfp4MoEMethod produces for Kimi-K3 under AITER_SITUV2_A8W4.
     # Only the 16-row block index differs, so it costs one remap in ug_loads.
     guint: bool = False
+    # Fold a residual into the final reduce (FINAL + resid -> out). Uses the
+    # fact that CTAs stay resident through reduce: one less host launch and
+    # one less global readback of out before the add.
+    fuse_resid: bool = False
 
 
 ABI = KernelAbi(
@@ -188,6 +194,7 @@ ABI = KernelAbi(
         "ln_w",
         "w_up",
         "out",
+        "resid",
         "scratch",
         "queue",
         "peers",
@@ -545,15 +552,12 @@ def bo_ld_f32(ptr, i):
 
 
 @traced
-def load_route(c):
-    """ROUTE -> LDS (ids, weights); the union U: slot_of[e], expert_of[slot],
-    kof[slot][t] (the token's top-k index, -1 if not picked); returns |U|."""
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+def prezero_route_lds(c):
+    """Clear route union scratch in LDS. Safe before ROUTE is published; idle
+    CTAs run this under the early/LAT critical path so load_route's poll is
+    pure wait+copy."""
+    tid = c["tid"]
     rt = c["rt"]
-    n = s * 2 * TOPK
-    if tid < n:
-        v = c["poll"]([(c["route"], tid, 1)])[0][0]
-        fx.ptr_store(v, rt["route"] + tid)
     for i in range_constexpr((E + THREADS - 1) // THREADS):
         e = tid + THREADS * i
         if e < E:
@@ -562,6 +566,22 @@ def load_route(c):
         j = tid + THREADS * i
         if j < MAX_U * 8:
             fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
+
+
+@traced
+def load_route(c):
+    """ROUTE -> LDS (ids, weights); the union U: slot_of[e], expert_of[slot],
+    kof[slot][t] (the token's top-k index, -1 if not picked); returns |U|.
+
+    Call ``prezero_route_lds`` first (before ``load_latq``) so flag/kof clears
+    overlap the early LAT wait. This poll assumes that prezero already ran.
+    """
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    rt = c["rt"]
+    n = s * 2 * TOPK
+    if tid < n:
+        v = c["poll"]([(c["route"], tid, 1)])[0][0]
+        fx.ptr_store(v, rt["route"] + tid)
     gpu.barrier()
     if tid < s * TOPK:
         t = tid // TOPK
@@ -1137,7 +1157,12 @@ def stage_up(c, j):
 
 @traced
 def stage_reduce(c, j):
-    """Columns 128 j ..: FINAL in rank order -> bf16 out."""
+    """Columns 128 j ..: FINAL in rank order -> bf16 out.
+
+    With ``fuse_resid``, add ``args.resid`` (bf16, same layout as out) in FP32
+    before the store — the layer residual / AttnRes prefix, folded here so the
+    host does not relaunch a vector add after the monokernel exits.
+    """
     s, tid = c["S"], c["tid"]
     if tid < s * 64:
         t = tid // 64
@@ -1149,6 +1174,19 @@ def stage_reduce(c, j):
             lambda src: ((src * s + t) * HIDDEN + col) // 2,
             TP,
         )
+        if const_expr(c["fuse_resid"]):
+            rw = fx.Int32(
+                bo.buffer_load(
+                    rsrc(c["args"]["resid"]),
+                    (t * HIDDEN + col) // 2,
+                    vec_width=1,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            r0, r1 = bf2_f32(rw)
+            lo = lo + r0
+            hi = hi + r1
         w = (
             fx.Vector.from_elements([lo, hi], fx.Float32)
             .to(fx.BFloat16)
@@ -1208,7 +1246,10 @@ def build(key: MoeBuild):
         qslot: fx.Array[fx.Int32, 4, 16]
 
     keyed = key_tuple(key, _SOURCES)
-    name = f"k3_mono_moe_s{s}_r{int(key.reduce)}_t{int(key.timeline)}"
+    name = (
+        f"k3_mono_moe_s{s}_r{int(key.reduce)}_t{int(key.timeline)}"
+        f"_fr{int(key.fuse_resid)}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def moe(
@@ -1225,6 +1266,7 @@ def build(key: MoeBuild):
         ln_w: Int64,
         w_up: Int64,
         out: Int64,
+        resid: Int64,
         scratch: Int64,
         queue: Int64,
         peers: Int64,
@@ -1292,6 +1334,7 @@ def build(key: MoeBuild):
             "par": par,
             "xp": key.xp,
             "guint": key.guint,
+            "fuse_resid": key.fuse_resid,
             "lazy_inter": True,
             "args": {
                 "x": x,
@@ -1307,6 +1350,7 @@ def build(key: MoeBuild):
                 "ln_w": ln_w,
                 "w_up": w_up,
                 "out": out,
+                "resid": resid,
             },
         }
         for region in (
@@ -1338,7 +1382,15 @@ def build(key: MoeBuild):
         stamp(on, tls, tid, 2)
         if const_expr(key.stop <= 3):
             return
+        # Idle CTAs reach here while early CTAs still publish LAT. Prefill
+        # route LDS, then quantize peer LAT; load_route's poll stays short.
+        prezero_route_lds(c)
+        load_latq(c)
+        stamp(on, tls, tid, 3)
+        if const_expr(key.stop == 36):
+            return
         nu = load_route(c)
+        stamp(on, tls, tid, 4)
         if const_expr(key.stop == 35):
             # debug: the route table, |U| and U into ``out`` (as int32), CTA 0
             if bid == 0:
@@ -1351,9 +1403,6 @@ def build(key: MoeBuild):
                     )
                 if tid == 0:
                     bo.buffer_store(nu, rsrc(out), n)
-            return
-        load_latq(c)
-        if const_expr(key.stop == 36):
             return
         # static round-robin: deterministic, no state across launches (a
         # counter carried between steps went stale when a step skipped K2b)
@@ -1371,7 +1420,7 @@ def build(key: MoeBuild):
             stage_ug(c, task, ops)
             task = nxt
             ops = ops_n
-        stamp(on, tls, tid, 3)
+        stamp(on, tls, tid, 5)
         if const_expr(key.stop <= 4):
             stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
             return
@@ -1384,21 +1433,21 @@ def build(key: MoeBuild):
         # the shared down (needed only by up) on the CTAs with no down task:
         # after their ug, so every CTA's ug starts as the route lands
         run_sdown(c, bid, w_sd)
-        stamp(on, tls, tid, 4)
+        stamp(on, tls, tid, 6)
         if const_expr(key.stop <= 5):
             return
         if (bid >= LN0) & (bid < LN0 + LN_TASKS):
             stage_lnorm(c, bid - LN0)
-        stamp(on, tls, tid, 5)
+        stamp(on, tls, tid, 7)
         if const_expr(key.stop <= 6):
             return
         if bid < UP_TASKS:
             stage_up(c, bid)
-        stamp(on, tls, tid, 6)
+        stamp(on, tls, tid, 8)
         if const_expr(key.reduce):  # noqa: SIM102 (traced: `and` does not combine traced values)
             if (bid >= RED0) & (bid < RED0 + RED_TASKS):
                 stage_reduce(c, bid - RED0)
-        stamp(on, tls, tid, 7)
+        stamp(on, tls, tid, 9)
         stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
@@ -1416,6 +1465,7 @@ def build(key: MoeBuild):
         ln_w: Int64,
         w_up: Int64,
         out: Int64,
+        resid: Int64,
         scratch: Int64,
         queue: Int64,
         peers: Int64,
@@ -1441,6 +1491,7 @@ def build(key: MoeBuild):
             ln_w,
             w_up,
             out,
+            resid,
             scratch,
             queue,
             peers,
@@ -1478,16 +1529,20 @@ def moe(
     rank,
     epoch,
     layer,
+    resid=None,
     tl=None,
     diag=None,
 ):
     """Host launcher; every weight as vLLM holds it after loading (MOE_SPEC.md
     §5), the experts' shuffled. ``queue``: QUEUE_BYTES of zeros, this launch's
-    alone (no other kernel writes it)."""
+    alone (no other kernel writes it). ``resid``: optional bf16 [S, H] folded
+    into the final reduce when ``key.fuse_resid``."""
     assert queue.numel() * queue.element_size() >= QUEUE_BYTES
     assert w_gate.shape == (E, HIDDEN) and w_ld.shape == (LAT, HIDDEN)
     assert w_sgu.shape == (2 * SI, HIDDEN) and w_sd.shape == (HIDDEN, SI)
     assert w_up.shape == (UP_N, LAT) and w_up.is_contiguous()
+    if key.fuse_resid:
+        assert resid is not None and resid.shape == out.shape and resid.is_contiguous()
     f = build(key)
     f(
         x.data_ptr(),
@@ -1503,6 +1558,7 @@ def moe(
         ln_w.data_ptr(),
         w_up.data_ptr(),
         out.data_ptr(),
+        0 if resid is None else resid.data_ptr(),
         scratch.data_ptr(),
         queue.data_ptr(),
         peers.data_ptr(),

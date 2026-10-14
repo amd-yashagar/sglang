@@ -31,6 +31,7 @@ seven waiting for ever. ``_tp_agree`` makes the decision collective.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -154,6 +155,23 @@ def mono_supported(moe: KimiK3MoE) -> bool:
     if not envs.SGLANG_K3_MONO_DECODE.get() or not is_hip():
         return False
 
+    # Weight layout: A4W4 weekly uses separated gate/up (guint=False); A8W4
+    # uses interleaved (guint=True). The FlyDSL kernel supports both via the
+    # MoeBuild.guint flag. Activations are quantized to MXFP4 inside the
+    # kernel (A4W4-style), independent of the staged A8W4 FP8 path.
+    a4 = os.environ.get("AITER_SITUV2_A4W4", "0") == "1"
+    a8 = os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+    if a4 and a8:
+        _log_once(
+            "Kimi-K3 mono decode: both AITER_SITUV2_A4W4 and A8W4 are set; "
+            "guint follows Mxfp4MoEMethod (_aiter_situ_uses_gu_interleaved)."
+        )
+    elif a4:
+        _log_once(
+            "Kimi-K3 mono decode: A4W4 weekly layout (separated w13 + inline "
+            "MXFP4 act) — this is the kernel's native expert path."
+        )
+
     experts = getattr(moe, "experts", None)
     shared = getattr(moe, "shared_experts", None)
     up_proj = getattr(moe, "routed_expert_up_proj", None)
@@ -224,6 +242,14 @@ class MonoMoe:
         self._rank = get_parallel().tp_rank
         self._guint = _experts_are_gu_interleaved(moe.experts)
         self._w_up: Optional[torch.Tensor] = None
+        # Pre-sized for MONO_MAX_ROWS so CUDA-graph capture sees a stable
+        # storage; narrow to the live row count on each forward.
+        self._out = torch.empty(
+            MONO_MAX_ROWS,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device=moe.gate.weight.device,
+        )
         self._ready = False
         device = moe.gate.weight.device
 
@@ -269,21 +295,35 @@ class MonoMoe:
             and x.is_contiguous()
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the whole MoE for one decode step. Returns the all-reduced sum
-        of the routed and shared experts; the caller still owns the residual."""
+    def forward(
+        self, x: torch.Tensor, resid: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Run the whole MoE for one decode step.
+
+        Returns the all-reduced routed+shared sum, or that sum plus ``resid``
+        when ``resid`` is passed (fused into the in-kernel reduce).
+        """
         from sglang.kernels.ops.moe.k3_mono_flydsl import runner
         from sglang.kernels.ops.moe.k3_mono_flydsl.stages import moe as moe_stage
 
         _log_once("Kimi-K3 mono decode engaged on a decode step")
         m = self._moe
         experts = m.experts
-        out = torch.empty_like(x)
+        rows = x.size(0)
+        out = self._out[:rows]
+        fuse = resid is not None
+        if fuse:
+            assert (
+                resid.shape == x.shape
+                and resid.dtype == torch.bfloat16
+                and resid.is_contiguous()
+            )
         moe_stage.moe(
             moe_stage.MoeBuild(
-                tokens=x.size(0),
+                tokens=rows,
                 eps=m.routed_expert_norm.variance_epsilon,
                 guint=self._guint,
+                fuse_resid=fuse,
             ),
             x=x,
             w_gate=m.gate.weight,
@@ -298,6 +338,7 @@ class MonoMoe:
             ln_w=m.routed_expert_norm.weight,
             w_up=self.w_up(),
             out=out,
+            resid=resid,
             queue=runner.queue(),
             **runner.launch_args(),
             # K1 owns tags below 128; the MoE launches take the upper half.
@@ -403,14 +444,26 @@ class MonoK2:
         # every other layer starts it from the stream's written residual, which
         # the boundary lends out read-only, so this class owns the buffer in
         # both modes and copies that residual in. Allocate before graph capture.
-        if True:
-            weight = layer.self_attn.o_proj.weight
-            self._prefix = torch.empty(
-                MONO_MAX_ROWS,
-                HIDDEN_SIZE,
-                dtype=torch.bfloat16,
-                device=weight.device,
-            )
+        weight = layer.self_attn.o_proj.weight
+        self._prefix = torch.empty(
+            MONO_MAX_ROWS,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
+        self._out = torch.empty(
+            MONO_MAX_ROWS,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
+        # Gated-core handoff buffer when K1 chains into K2 (graph-stable).
+        self._core = torch.empty(
+            MONO_MAX_ROWS,
+            CORE_SIZE,
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
 
     def covered(
         self,
@@ -482,20 +535,27 @@ class MonoK2:
         layer = self._layer
         moe = layer.mlp
         experts = moe.experts
+        rows = normed.size(0)
         if core is None:
             core = layer._run_self_attn(
                 normed, positions, forward_batch, zero_allocator, core=True
             )
-        rows = core.size(0)
         assert core.shape == (rows, CORE_SIZE) and core.dtype == torch.bfloat16
-        core = core.contiguous()
+        if not core.is_contiguous():
+            self._core[:rows].copy_(core)
+            core = self._core[:rows]
+        elif core.data_ptr() != self._core.data_ptr():
+            # Keep a stable storage for CUDA-graph capture when attn returns
+            # a fresh view each step.
+            self._core[:rows].copy_(core)
+            core = self._core[:rows]
 
         prefix = self._prefix[:rows]
         if prefix_sum is not None:
             # Not `prefix = prefix_sum`: that tensor is the residual stream's,
             # lent out read-only, and the kernel updates its prefix in place.
             prefix.copy_(prefix_sum)
-        out = torch.empty_like(prefix)
+        out = self._out[:rows]
         k2.k2_launch(
             k2.K2Build(
                 tokens=rows,
@@ -505,6 +565,8 @@ class MonoK2:
                 ln_eps=moe.routed_expert_norm.variance_epsilon,
                 reset=layer.is_block_write_layer,
                 guint=self._mono._guint,
+                # Layer output = MoE + AttnRes-updated prefix, in-kernel.
+                fuse_resid=True,
             ),
             core=core,
             w_o=layer.self_attn.o_proj.weight,
@@ -530,7 +592,7 @@ class MonoK2:
             # for a given layer in a given step.
             layer=128 + layer.layer_idx,
         )
-        return out + prefix
+        return out
 
     def maybe_forward(
         self,
@@ -677,6 +739,12 @@ class MonoK1:
             dtype=torch.bfloat16,
             device=self._w_in.device,
         )
+        self._core_out = torch.empty(
+            MONO_MAX_ROWS,
+            CORE_SIZE,
+            dtype=torch.bfloat16,
+            device=self._w_in.device,
+        )
 
     def covered(self, prefix: torch.Tensor, attn_res: AttnResidual) -> bool:
         """Fail closed, like the other two launches: the kernel reads raw
@@ -762,9 +830,7 @@ class MonoK1:
             state["committed_ssm"].index_select(0, slot).to(flat_ssm.dtype),
         )
 
-        core = torch.empty(
-            prefix.size(0), CORE_SIZE, dtype=torch.bfloat16, device=prefix.device
-        )
+        core = self._core_out[: prefix.size(0)]
         kda.kda_pre(
             kda.KdaPreBuild(
                 tokens=prefix.size(0),

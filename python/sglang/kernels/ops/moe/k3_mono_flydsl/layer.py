@@ -94,6 +94,9 @@ class K2Build:
     timeline: bool = False
     xp: int = 0  # timing experiments (7: route without its selection)
     guint: bool = False  # w13's AITER layout; see stages.moe.MoeBuild
+    # Fold the AttnRes-updated prefix into the MoE reduce -> layer output in
+    # ``out`` (no host ``out + prefix`` after the launch).
+    fuse_resid: bool = False
 
 
 ABI = KernelAbi(
@@ -226,7 +229,7 @@ def build(key: K2Build):
     keyed = key_tuple(key, _SOURCES)
     name = (
         f"k3_mono_k2_s{s}_nb{key.nblocks}_x{int(key.reset)}_r{int(key.reduce)}"
-        f"_g{int(key.diag)}_t{int(key.timeline)}"
+        f"_g{int(key.diag)}_t{int(key.timeline)}_fr{int(key.fuse_resid)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -300,6 +303,7 @@ def build(key: K2Build):
             "ln_eps": key.ln_eps,
             "xp": key.xp,
             "guint": key.guint,
+            "fuse_resid": key.fuse_resid,
             "lazy_inter": True,
             "put": mb.put,
             "put_bf": mb.put_bf,
@@ -335,6 +339,8 @@ def build(key: K2Build):
                 "core": core,
                 "w_o": w_o,
                 "prefix": prefix,
+                # Resid for the fused reduce: the AttnRes-updated prefix.
+                "resid": prefix,
                 "blocks": blocks,
                 "blk_sm": blk_sm,
                 "blk_sr": blk_sr,
@@ -564,7 +570,8 @@ def k2_launch(
     tl=None,
 ):
     """Host launcher: ``core`` [S, 1536] (o_proj's input), ``prefix`` updated in
-    place, ``out`` the MoE output [S, 7168]; MoE weights as ``moe``."""
+    place, ``out`` the MoE output [S, 7168] (or MoE+prefix when
+    ``key.fuse_resid``); MoE weights as ``moe``."""
     assert (
         w_o.shape == (HIDDEN, k2a.OK)
         and core.is_contiguous()

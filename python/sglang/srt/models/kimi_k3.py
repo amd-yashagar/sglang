@@ -1505,11 +1505,9 @@ class KimiK3MoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if self._mono is not None and self._mono.covered(hidden_states, forward_batch):
-            # The fused launch returns the all-reduced routed + shared sum.
-            # The caller still adds the residual. K2 absorbs that add.
-            out = self._mono.forward(hidden_states)
-            if prefix_sum is not None:
-                out = out + prefix_sum
+            # Residual folded into the in-kernel reduce when prefix_sum is set.
+            # (K2 folds the AttnRes-updated prefix the same way.)
+            out = self._mono.forward(hidden_states, resid=prefix_sum)
         elif hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:

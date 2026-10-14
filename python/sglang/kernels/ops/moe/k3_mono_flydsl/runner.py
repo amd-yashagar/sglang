@@ -30,7 +30,8 @@ class _State:
 
 def alloc_scratch(device) -> None:
     """At model init, outside any graph capture: the largest build's scratch
-    and the epoch."""
+    and the epoch. Also prewarms MoE/K2 JIT builds for every live row count so
+    the first decode step does not pay compile latency on the critical path."""
     if _State.scratch is not None:
         return
     from sglang.kernels.ops.moe.k3_mono_flydsl import layer
@@ -54,6 +55,13 @@ def alloc_scratch(device) -> None:
     _State.scratch = torch.zeros(_State.zero_bytes, dtype=torch.uint8, device=device)
     _State.epoch = torch.zeros(1, dtype=torch.int32, device=device)
     _State.queue = torch.zeros(moe.QUEUE_BYTES // 4, dtype=torch.int32, device=device)
+    # Prewarm the hot production keys (A4W4 separated + fused residual). Other
+    # (tokens, guint, nblocks) combos JIT on first use — full cartesian prewarm
+    # would serialize minutes of FlyDSL compile across every TP rank at init.
+    for tokens in (1, 2, 4, 8):
+        moe.build(moe.MoeBuild(tokens=tokens, fuse_resid=True))
+        moe.build(moe.MoeBuild(tokens=tokens, fuse_resid=False))
+        layer.build(layer.K2Build(tokens=tokens, nblocks=8, fuse_resid=True))
 
 
 def step_begin() -> None:
