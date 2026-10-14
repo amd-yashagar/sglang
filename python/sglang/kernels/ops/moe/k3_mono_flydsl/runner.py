@@ -17,7 +17,26 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     from sglang.kernels.ops.moe.k3_mono_flydsl.common.peer_memory import PeerBuffer
 
-MAX_TOKENS = 8  # the x rows fit one CTA's LDS
+# One CTA's StageLds/RouteLds fit at most this many token rows (gfx950 160 KiB).
+# Wider decode batches (up to MONO_MAX_ROWS) are served as sequential tile
+# launches of this width; each tile bumps the mailbox epoch so peer tags
+# never collide across tiles of the same layer.
+LDS_TOKENS = 8
+MAX_TOKENS = LDS_TOKENS
+# Serve / CUDA-graph capture ceiling (uplift decode conc ≤ 64).
+MONO_MAX_ROWS = 64
+
+
+def iter_token_tiles(rows: int, tile: int = LDS_TOKENS):
+    """Yield (offset, count) covering ``rows`` in LDS-sized tiles."""
+    for t0 in range(0, rows, tile):
+        yield t0, min(tile, rows - t0)
+
+
+def bump_epoch_between_tiles(tile_index: int) -> None:
+    """Fresh mailbox tags for tile 1..N-1 of a multi-tile decode step."""
+    if tile_index > 0 and _State.epoch is not None:
+        _State.epoch.add_(1)
 
 
 class _State:

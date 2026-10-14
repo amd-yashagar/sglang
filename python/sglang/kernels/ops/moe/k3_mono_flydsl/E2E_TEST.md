@@ -4,7 +4,8 @@
 **Branch:** `k3-monokernel-fuse-opt` (this work on top of the [#43481](https://github.com/sgl-project/sglang/pull/43481) integrate).  
 **AITER:** no fork branch required — use your normal ROCm/AITER install (`SGLANG_USE_AITER=1`). This path does **not** depend on MegaMoE / Aiter #6259.
 
-Target: **MI355X / gfx950, TP=8**, decode rows **≤ 8**, weekly **A4W4** (`AITER_SITUV2_A4W4=1`).
+Target: **MI355X / gfx950, TP=8**, decode rows **≤ 64** (LDS tile 8; host
+tiling for 16/32/64), weekly **A4W4** (`AITER_SITUV2_A4W4=1`).
 
 ## What this branch adds (vs staged serve)
 
@@ -45,7 +46,10 @@ PYTHONPATH=python python3 test/registered/amd/test_kimi_k3_mono_kda_pre.py
 ```
 
 Expect MoE cos ≥ 0.999 vs staged AITER; K2 seam cos ~1.0.  
-On gfx950 TP8, MoE-layer HIP timing vs staged+2×RCCL has been **~3.3–5.5×** at rows 1/4/8 (not e2e tokens/s).
+On gfx950 TP8, MoE-layer HIP timing vs staged+2×RCCL: **~3–5.5×** at rows
+1/4/8; host-tiled **~1.9×** at 16; **~0.9×** at 32 (tile tax — improve next);
+**~4×** at 64 vs tile-staged (full AITER sorter broken at 64 here). Not e2e
+tokens/s. Wide sweep: `kimi-k3/monokernel/timed_mono_vs_staged.py`.
 
 ## Serve A/B (needs Kimi-K3 checkpoint)
 

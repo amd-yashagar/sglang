@@ -45,9 +45,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The kernels are built for at most this many rows, because the rows have to
-# fit one CTA's LDS. At concurrency 1 a DSPARK-7 verify step is exactly 8.
-MONO_MAX_ROWS = 8
+# Decode rows the host will serve. One CTA's LDS holds MONO_TILE rows (kernel
+# MAX_TOKENS); wider batches are sequential tile launches. 64 covers the
+# uplift-plan decode conc grid (4…64). Keep these equal to runner.LDS_TOKENS /
+# runner.MONO_MAX_ROWS.
+MONO_TILE = 8
+MONO_MAX_ROWS = 64
 MONO_TP_SIZE = 8
 HIDDEN_SIZE = 7168
 LATENT_SIZE = 3584
@@ -55,6 +58,8 @@ LATENT_SIZE = 3584
 CORE_SIZE = 1536
 # The attention-residual bank rows the layer launch is built for.
 MONO_MAX_BLOCKS = 8
+# K1 is not host-tiled yet (conv state / qlen); keep it at one LDS tile.
+K1_MAX_ROWS = MONO_TILE
 
 _logged: set[str] = set()
 
@@ -302,6 +307,10 @@ class MonoMoe:
 
         Returns the all-reduced routed+shared sum, or that sum plus ``resid``
         when ``resid`` is passed (fused into the in-kernel reduce).
+
+        Batches wider than ``MONO_TILE`` are covered by sequential LDS-width
+        launches; each extra tile bumps the mailbox epoch so peer tags stay
+        unique under CUDA-graph replay.
         """
         from sglang.kernels.ops.moe.k3_mono_flydsl import runner
         from sglang.kernels.ops.moe.k3_mono_flydsl.stages import moe as moe_stage
@@ -318,32 +327,37 @@ class MonoMoe:
                 and resid.dtype == torch.bfloat16
                 and resid.is_contiguous()
             )
-        moe_stage.moe(
-            moe_stage.MoeBuild(
-                tokens=rows,
-                eps=m.routed_expert_norm.variance_epsilon,
-                guint=self._guint,
-                fuse_resid=fuse,
-            ),
-            x=x,
-            w_gate=m.gate.weight,
-            bias=m.gate.e_score_correction_bias,
-            w_ld=m.routed_expert_down_proj.weight,
-            w_sgu=m.shared_experts.gate_up_proj.weight,
-            w_sd=m.shared_experts.down_proj.weight,
-            w13=experts.w13_weight,
-            w13s=experts.w13_weight_scale,
-            w2=experts.w2_weight,
-            w2s=experts.w2_weight_scale,
-            ln_w=m.routed_expert_norm.weight,
-            w_up=self.w_up(),
-            out=out,
-            resid=resid,
-            queue=runner.queue(),
-            **runner.launch_args(),
-            # K1 owns tags below 128; the MoE launches take the upper half.
-            layer=128 + self._layer_idx,
-        )
+        w_up = self.w_up()
+        launch = runner.launch_args()
+        queue = runner.queue()
+        for tile_i, (t0, n) in enumerate(runner.iter_token_tiles(rows, MONO_TILE)):
+            runner.bump_epoch_between_tiles(tile_i)
+            moe_stage.moe(
+                moe_stage.MoeBuild(
+                    tokens=n,
+                    eps=m.routed_expert_norm.variance_epsilon,
+                    guint=self._guint,
+                    fuse_resid=fuse,
+                ),
+                x=x[t0 : t0 + n],
+                w_gate=m.gate.weight,
+                bias=m.gate.e_score_correction_bias,
+                w_ld=m.routed_expert_down_proj.weight,
+                w_sgu=m.shared_experts.gate_up_proj.weight,
+                w_sd=m.shared_experts.down_proj.weight,
+                w13=experts.w13_weight,
+                w13s=experts.w13_weight_scale,
+                w2=experts.w2_weight,
+                w2s=experts.w2_weight_scale,
+                ln_w=m.routed_expert_norm.weight,
+                w_up=w_up,
+                out=out[t0 : t0 + n],
+                resid=None if not fuse else resid[t0 : t0 + n],
+                queue=queue,
+                **launch,
+                # K1 owns tags below 128; the MoE launches take the upper half.
+                layer=128 + self._layer_idx,
+            )
         return out
 
 
@@ -354,7 +368,10 @@ def maybe_build_mono(moe: KimiK3MoE) -> Optional[MonoMoe]:
     mono = MonoMoe(moe)
     if not mono._ready:
         return None
-    _log_once("Kimi-K3 mono decode armed (TP8, decode steps of at most 8 rows)")
+    _log_once(
+        f"Kimi-K3 mono decode armed (TP8, ≤{MONO_MAX_ROWS} rows, "
+        f"LDS tile {MONO_TILE})"
+    )
     return mono
 
 
@@ -556,42 +573,50 @@ class MonoK2:
             # lent out read-only, and the kernel updates its prefix in place.
             prefix.copy_(prefix_sum)
         out = self._out[:rows]
-        k2.k2_launch(
-            k2.K2Build(
-                tokens=rows,
-                nblocks=self._nblocks,
-                eps=layer.mlp_res_norm.variance_epsilon,
-                out_eps=layer.post_attention_layernorm.variance_epsilon,
-                ln_eps=moe.routed_expert_norm.variance_epsilon,
-                reset=layer.is_block_write_layer,
-                guint=self._mono._guint,
-                # Layer output = MoE + AttnRes-updated prefix, in-kernel.
-                fuse_resid=True,
-            ),
-            core=core,
-            w_o=layer.self_attn.o_proj.weight,
-            prefix=prefix,
-            blocks=attn_res.block_residual,
-            ares_nw=layer.mlp_res_norm.weight,
-            ares_qk=layer.mlp_res_proj.weight.view(HIDDEN_SIZE),
-            in_nw=layer.post_attention_layernorm.weight,
-            w_gate=moe.gate.weight,
-            bias=moe.gate.e_score_correction_bias,
-            w_ld=moe.routed_expert_down_proj.weight,
-            w_sgu=moe.shared_experts.gate_up_proj.weight,
-            w_sd=moe.shared_experts.down_proj.weight,
-            w13=experts.w13_weight,
-            w13s=experts.w13_weight_scale,
-            w2=experts.w2_weight,
-            w2s=experts.w2_weight_scale,
-            ln_w=moe.routed_expert_norm.weight,
-            w_up=self._mono.w_up(),
-            out=out,
-            **runner.launch_args(),
-            # Same tag as this layer's MoE-only launch: only one of them runs
-            # for a given layer in a given step.
-            layer=128 + layer.layer_idx,
-        )
+        bank = attn_res.block_residual
+        w_up = self._mono.w_up()
+        launch = runner.launch_args()
+        for tile_i, (t0, n) in enumerate(runner.iter_token_tiles(rows, MONO_TILE)):
+            runner.bump_epoch_between_tiles(tile_i)
+            blocks = bank[t0 : t0 + n]
+            # Dim-0 narrow of a contiguous [R, B, H] bank stays contiguous.
+            assert blocks.is_contiguous(), "attn residual tile must be contiguous"
+            k2.k2_launch(
+                k2.K2Build(
+                    tokens=n,
+                    nblocks=self._nblocks,
+                    eps=layer.mlp_res_norm.variance_epsilon,
+                    out_eps=layer.post_attention_layernorm.variance_epsilon,
+                    ln_eps=moe.routed_expert_norm.variance_epsilon,
+                    reset=layer.is_block_write_layer,
+                    guint=self._mono._guint,
+                    # Layer output = MoE + AttnRes-updated prefix, in-kernel.
+                    fuse_resid=True,
+                ),
+                core=core[t0 : t0 + n],
+                w_o=layer.self_attn.o_proj.weight,
+                prefix=prefix[t0 : t0 + n],
+                blocks=blocks,
+                ares_nw=layer.mlp_res_norm.weight,
+                ares_qk=layer.mlp_res_proj.weight.view(HIDDEN_SIZE),
+                in_nw=layer.post_attention_layernorm.weight,
+                w_gate=moe.gate.weight,
+                bias=moe.gate.e_score_correction_bias,
+                w_ld=moe.routed_expert_down_proj.weight,
+                w_sgu=moe.shared_experts.gate_up_proj.weight,
+                w_sd=moe.shared_experts.down_proj.weight,
+                w13=experts.w13_weight,
+                w13s=experts.w13_weight_scale,
+                w2=experts.w2_weight,
+                w2s=experts.w2_weight_scale,
+                ln_w=moe.routed_expert_norm.weight,
+                w_up=w_up,
+                out=out[t0 : t0 + n],
+                **launch,
+                # Same tag as this layer's MoE-only launch: only one of them runs
+                # for a given layer in a given step.
+                layer=128 + layer.layer_idx,
+            )
         return out
 
     def maybe_forward(
@@ -646,7 +671,7 @@ K1_HEAD_DIM = 128
 K1_QKV_DIM = 3 * CORE_SIZE  # the conv channels: q, k and v
 # The launch rebases its conv buffer every call, writing qlen entries after the
 # carried window. We own the buffer, so size it for the widest step.
-K1_STATE_LEN = MONO_MAX_ROWS + K1_WIN
+K1_STATE_LEN = K1_MAX_ROWS + K1_WIN
 
 
 def k1_supported(layer: KimiK3DecoderLayer) -> bool:
@@ -740,7 +765,7 @@ class MonoK1:
             device=self._w_in.device,
         )
         self._core_out = torch.empty(
-            MONO_MAX_ROWS,
+            K1_MAX_ROWS,
             CORE_SIZE,
             dtype=torch.bfloat16,
             device=self._w_in.device,
@@ -751,7 +776,7 @@ class MonoK1:
         addresses, so a wrong dtype or stride is read, not rejected."""
         bank = attn_res.block_residual
         return (
-            0 < prefix.size(0) <= MONO_MAX_ROWS
+            0 < prefix.size(0) <= K1_MAX_ROWS
             and prefix.size(1) == HIDDEN_SIZE
             and prefix.dtype == torch.bfloat16
             and prefix.is_contiguous()
@@ -789,7 +814,7 @@ class MonoK1:
         #
         # One request per launch. K1 indexes the conv buffer and the recurrent
         # state with the same slot number. A private conv buffer therefore
-        # serves one request only. covered() caps the rows at MONO_MAX_ROWS,
+        # serves one request only. covered() caps the rows at K1_MAX_ROWS,
         # so a second request cannot fit anyway.
         if qlen <= 0 or prefix.size(0) != qlen or rows.numel() < 1:
             _log_once(
