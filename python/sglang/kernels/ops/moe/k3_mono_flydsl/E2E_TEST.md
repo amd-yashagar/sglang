@@ -1,8 +1,11 @@
 # Kimi-K3 decode monokernel — e2e test instructions
 
-**Repo:** SGLang only (`amd-yashagar/sglang`).  
-**Branch:** `k3-monokernel-fuse-opt` (this work on top of the [#43481](https://github.com/sgl-project/sglang/pull/43481) integrate).  
-**AITER:** no fork branch required — use your normal ROCm/AITER install (`SGLANG_USE_AITER=1`). This path does **not** depend on MegaMoE / Aiter #6259.
+**SGLang:** `amd-yashagar/sglang` · branch **`k3-monokernel-fuse-opt`**
+(on top of [#43481](https://github.com/sgl-project/sglang/pull/43481)).  
+**AITER (recommended for conc 64 baseline/fallback):** `amd-yashagar/aiter` ·
+branch **`k3-moe-sorting-opus-abi`** — tolerates stale
+`moe_sorting_opus_get_workspace_size` ABI (else rebuild opus with
+`AITER_REBUILD=1`). Mono itself does **not** need MegaMoE / Aiter #6259.
 
 Target: **MI355X / gfx950, TP=8**, decode rows **≤ 64** (LDS tile 8; host
 tiling for 16/32/64), weekly **A4W4** (`AITER_SITUV2_A4W4=1`).
@@ -22,15 +25,20 @@ Also on this branch: `fuse_resid` (residual in-kernel), buffer prealloc, A4W4 na
 ## Checkout
 
 ```bash
+# SGLang (required)
 git clone git@github.com:amd-yashagar/sglang.git
 cd sglang
 git fetch origin k3-monokernel-fuse-opt
 git checkout k3-monokernel-fuse-opt
-# install / PYTHONPATH as you usually do for this image
 export PYTHONPATH=$PWD/python:${PYTHONPATH}
+
+# AITER (recommended — avoids S=64 fused_moe sorter crash on stale opus .so)
+git clone git@github.com:amd-yashagar/aiter.git
+cd aiter && git fetch origin k3-moe-sorting-opus-abi && git checkout k3-moe-sorting-opus-abi
+# install as usual for this image; or AITER_REBUILD=1 python -c 'import aiter; aiter.moe_sorting_opus_get_workspace_size(64,896,16,0,0)'
 ```
 
-Optional baseline without the fuse/perf commits: branch `k3-monokernel` (PR integrate only), same fork.
+Optional SGLang baseline without fuse/perf commits: branch `k3-monokernel` (PR integrate only), same fork.
 
 ## Microbench (no weights; 8 GPUs)
 
@@ -45,11 +53,23 @@ PYTHONPATH=python python3 test/registered/amd/test_kimi_k3_mono_decode.py --guin
 PYTHONPATH=python python3 test/registered/amd/test_kimi_k3_mono_kda_pre.py
 ```
 
-Expect MoE cos ≥ 0.999 vs staged AITER; K2 seam cos ~1.0.  
-On gfx950 TP8, MoE-layer HIP timing vs staged+2×RCCL: **~3–5.5×** at rows
-1/4/8; host-tiled **~1.9×** at 16; **~0.9×** at 32 (tile tax — improve next);
-**~4×** at 64 vs tile-staged (full AITER sorter broken at 64 here). Not e2e
-tokens/s. Wide sweep: `kimi-k3/monokernel/timed_mono_vs_staged.py`.
+Expect MoE cos ≥ 0.999 vs staged AITER; K2 seam cos ~1.0.
+
+### MoE-layer microbench (gfx950 TP8, not e2e tokens/s)
+
+| rows | tiles | cos | staged med | mono med | speedup | Meaning |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 1 | ≥0.99998 | ~1.06 ms | ~0.20 ms | **~5.5×** | Fusion win (noisy @1) |
+| 4 | 1 | ≥0.99999 | ~0.81 ms | ~0.22 ms | **~3.8×** | Strong MoE-layer win |
+| 8 | 1 | 0.999993 | ~0.73 ms | ~0.23 ms | **~3.1×** | Ship band for S≤8 |
+| 16 | 2 | 0.999993 | ~0.71 ms | ~0.38 ms | **~1.9×** | Host tile-8 still ahead |
+| 32 | 4 | 0.999993 | ~1.15 ms | ~1.26 ms | **~0.9×** | Tile tax ≈ one fat fused_moe |
+| 64 | 8 | 0.999993 | ~0.84 ms | ~1.29 ms | **~0.65×** | Same; needs in-kernel multi-tile |
+
+**What this measures:** one MoE layer (router+experts+LN+up+2×AR) mono vs staged
+AITER+RCCL. **Not** serve ITL/TPOT. At S≥32 MoE-only can lose; e2e with
+`LAYER=1` still folds o_proj/AttnRes/extra launches — that is the e2e bet.
+Wide sweep script (outside tree): `timed_mono_vs_staged.py`.
 
 ## Serve A/B (needs Kimi-K3 checkpoint)
 
