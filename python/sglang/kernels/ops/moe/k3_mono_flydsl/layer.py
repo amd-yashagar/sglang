@@ -181,6 +181,9 @@ def build(key: K2Build):
         return _BUILDS[key]
     s, ns = key.tokens, key.nblocks + 1
     assert 1 <= s <= 8
+    # nblocks=0 makes stage_slice use nb-1 == -1 on the bank load (OOB) even
+    # when the prefix-only path discards the value.
+    assert key.nblocks >= 1, "K2 needs at least one AttnRes bank row"
     lay = scratch_layout(key)
     play = peer_layout(s)
     half = peer_bytes(s) // 2

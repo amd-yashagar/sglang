@@ -566,6 +566,7 @@ def prezero_route_lds(c):
         j = tid + THREADS * i
         if j < MAX_U * 8:
             fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
+    gpu.barrier()
 
 
 @traced

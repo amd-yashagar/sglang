@@ -74,13 +74,27 @@ def alloc_scratch(device) -> None:
     _State.scratch = torch.zeros(_State.zero_bytes, dtype=torch.uint8, device=device)
     _State.epoch = torch.zeros(1, dtype=torch.int32, device=device)
     _State.queue = torch.zeros(moe.QUEUE_BYTES // 4, dtype=torch.int32, device=device)
-    # Prewarm the hot production keys (A4W4 separated + fused residual). Other
-    # (tokens, guint, nblocks) combos JIT on first use — full cartesian prewarm
-    # would serialize minutes of FlyDSL compile across every TP rank at init.
+    # Prewarm hot production keys. Serve hits every AttnRes depth (nblocks=1
+    # early layers through MONO_MAX_BLOCKS) and both reset modes; skipping
+    # nblocks=1 was a latent first-use JIT on the decode critical path.
+    # guint / odd token counts still JIT on first use.
     for tokens in (1, 2, 4, 8):
         moe.build(moe.MoeBuild(tokens=tokens, fuse_resid=True))
         moe.build(moe.MoeBuild(tokens=tokens, fuse_resid=False))
-        layer.build(layer.K2Build(tokens=tokens, nblocks=8, fuse_resid=True))
+    for nblocks in range(1, 9):
+        for reset in (False, True):
+            layer.build(
+                layer.K2Build(
+                    tokens=MAX_TOKENS,
+                    nblocks=nblocks,
+                    fuse_resid=True,
+                    reset=reset,
+                )
+            )
+    for tokens in (1, 2, 4):
+        layer.build(
+            layer.K2Build(tokens=tokens, nblocks=1, fuse_resid=True, reset=False)
+        )
 
 
 def step_begin() -> None:

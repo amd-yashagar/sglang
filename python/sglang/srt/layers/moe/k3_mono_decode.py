@@ -423,8 +423,8 @@ def k2_supported(layer: KimiK3DecoderLayer, mono: MonoMoe) -> bool:
             "o_proj must have no bias",
         ),
         (
-            _k2_blocks(layer) <= MONO_MAX_BLOCKS,
-            f"at most {MONO_MAX_BLOCKS} attention-residual blocks",
+            1 <= _k2_blocks(layer) <= MONO_MAX_BLOCKS,
+            f"AttnRes bank depth must be in 1..{MONO_MAX_BLOCKS}",
         ),
     )
     for ok, why in checks:
@@ -481,6 +481,16 @@ class MonoK2:
             dtype=torch.bfloat16,
             device=weight.device,
         )
+        # Graph-stable AttnRes tile when bank[t0:t0+n] is non-contiguous (SP).
+        # Width is MONO_MAX_BLOCKS so stride(0) stays a full-capacity row pitch
+        # matching what the kernel expects when NB < bank depth.
+        self._blocks_tile = torch.empty(
+            MONO_TILE,
+            MONO_MAX_BLOCKS,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device=weight.device,
+        )
 
     def covered(
         self,
@@ -504,6 +514,7 @@ class MonoK2:
             self._mono._ready
             and _is_decode_step(forward_batch)
             and 0 < rows <= MONO_MAX_ROWS
+            and self._nblocks >= 1
             and normed.size(1) == HIDDEN_SIZE
             and normed.dtype == torch.bfloat16
             and normed.is_contiguous()
@@ -526,6 +537,7 @@ class MonoK2:
             nvb == self._nblocks
             and bank.dtype == torch.bfloat16
             and bank.size(0) >= rows
+            and bank.size(1) >= self._nblocks
             and bank.size(2) == HIDDEN_SIZE
             and bank.stride(2) == 1
         )
@@ -578,9 +590,17 @@ class MonoK2:
         launch = runner.launch_args()
         for tile_i, (t0, n) in enumerate(runner.iter_token_tiles(rows, MONO_TILE)):
             runner.bump_epoch_between_tiles(tile_i)
+            # Keep dim-1 capacity (bank depth): kernel strides are (B*H, H) with
+            # NB live sources; slicing to NB would make a non-contiguous view
+            # whose stride(0) no longer matches production.
             blocks = bank[t0 : t0 + n]
-            # Dim-0 narrow of a contiguous [R, B, H] bank stays contiguous.
-            assert blocks.is_contiguous(), "attn residual tile must be contiguous"
+            if not blocks.is_contiguous():
+                bcap = blocks.size(1)
+                assert bcap <= MONO_MAX_BLOCKS
+                # Full-width tile so stride(0) stays MONO_MAX_BLOCKS*H (contiguous).
+                self._blocks_tile[:n].zero_()
+                self._blocks_tile[:n, :bcap].copy_(blocks)
+                blocks = self._blocks_tile[:n]
             k2.k2_launch(
                 k2.K2Build(
                     tokens=n,
