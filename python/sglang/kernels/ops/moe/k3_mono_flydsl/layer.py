@@ -424,7 +424,9 @@ def build(key: K2Build):
         if bid >= NA:
             stamp(on, tls, tid, 2)
         # ---- the routed experts
-        # the latent (ready ~10 us before the route) quantized first
+        # Clear route union LDS under the LAT wait (same MoE overlap); load_route
+        # also clears, so skipping this would still be correct but slower to poll.
+        k2b.prezero_route_lds(c)
         k2b.load_latq(c)
         stamp(on, tls, tid, 12)
         nu = k2b.load_route(c)

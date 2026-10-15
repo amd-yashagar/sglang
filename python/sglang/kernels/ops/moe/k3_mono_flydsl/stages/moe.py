@@ -573,11 +573,22 @@ def load_route(c):
     """ROUTE -> LDS (ids, weights); the union U: slot_of[e], expert_of[slot],
     kof[slot][t] (the token's top-k index, -1 if not picked); returns |U|.
 
-    Call ``prezero_route_lds`` first (before ``load_latq``) so flag/kof clears
-    overlap the early LAT wait. This poll assumes that prezero already ran.
+    Always clears flag/kof here so callers (MoE and K2) are safe even when
+    they skip ``prezero_route_lds``. MoE still calls prezero earlier to overlap
+    the clear with the peer-LAT wait; a second clear is cheap (E + MAX_U ints).
     """
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt = c["rt"]
+    # LDS is not zeroed between stages: dirty flags make |U| huge and OOB.
+    for i in range_constexpr((E + THREADS - 1) // THREADS):
+        e = tid + THREADS * i
+        if e < E:
+            fx.ptr_store(fx.Int32(0), rt["flag"] + e)
+    for i in range_constexpr((MAX_U * 8 + THREADS - 1) // THREADS):
+        j = tid + THREADS * i
+        if j < MAX_U * 8:
+            fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
+    gpu.barrier()
     n = s * 2 * TOPK
     if tid < n:
         v = c["poll"]([(c["route"], tid, 1)])[0][0]
