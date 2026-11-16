@@ -1147,7 +1147,10 @@ class Envs:
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
         "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
     )
-    # Select the AITER MLA kernel for target verify, "asm" or "gluon".
+    # Select the AITER MLA kernel for target verify, "asm", "gluon", or
+    # "flydsl". "flydsl" asks for aiter's native low-head persistent kernel
+    # (4/8/12 heads per rank, no padding to 16); "asm" takes it on its own when
+    # the asm kernels have no kernel for the verify width (gfx942, qlen > 4).
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
