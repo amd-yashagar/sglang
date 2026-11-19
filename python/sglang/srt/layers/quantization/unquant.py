@@ -1016,6 +1016,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "k31_mla_fuse", False) and bias is None:
+            from sglang.srt.models.kimi_k3_amd.mla_gemm import (
+                mla_gemm_covered,
+                mla_linear,
+            )
+
+            if mla_gemm_covered(x, layer.weight):
+                return mla_linear(x, layer.weight)
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
@@ -1114,6 +1122,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if getattr(layer, "k31_mla_fuse", False) and bias is None:
+            from sglang.srt.models.kimi_k3_amd.mla_gemm import mla_linear_into
+
+            if mla_linear_into(x, layer.weight, output):
+                return output
         if (
             x.ndim == 2
             and output.dtype == torch.bfloat16

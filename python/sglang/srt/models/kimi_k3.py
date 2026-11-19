@@ -2730,6 +2730,13 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 )
                 self.register_parameter(f"{role}_b_qweight_type", qweight_type)
             self._kimi_split_gguf_kv_b = True
+        self._k31_mla_fuse = (
+            _is_gfx95
+            and get_bool_env_var("SGLANG_K31_MLA_FUSE", "false")
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
+        self._mla_a_gate_weight = None
+        self._mla_gate_precomputed = None
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -2827,6 +2834,60 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
 
+    def _merge_mla_a_gate_weights(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.runtime_context import get_lora
+
+        if not (
+            self._k31_mla_fuse
+            and self.use_output_gate
+            and self.dcp_size == 1
+            and self.has_fused_proj
+            and not get_lora().enable_lora
+            and not get_lora().lora_paths
+        ):
+            return
+        a = self.fused_qkv_a_proj_with_mqa
+        if not (
+            isinstance(a.quant_method, UnquantizedLinearMethod)
+            and isinstance(self.g_proj.quant_method, UnquantizedLinearMethod)
+            and a.weight.dtype == self.g_proj.weight.dtype == torch.bfloat16
+            and a.weight.shape == (2112, 7168)
+            and self.g_proj.weight.shape == (1536, 7168)
+        ):
+            return
+        # Reuse storage on reload; ordinary linears still see their original views.
+        self._mla_a_gate_weight, _ = _merge_weights_as_views(
+            [a, self.g_proj], target=self._mla_a_gate_weight
+        )
+        self._use_min_latency_fused_a_gemm = False
+        self._use_min_latency_q_b_gemm = False
+        for linear in (a, self.q_b_proj, self.g_proj, self.o_proj):
+            linear.k31_mla_fuse = True
+
+    def prepare_qkv_latent(self, hidden_states, forward_batch):
+        from sglang.srt.layers.layer_boundary import get_attn_tp_context
+
+        self._mla_gate_precomputed = None
+        if (
+            self._mla_a_gate_weight is not None
+            and not get_attn_tp_context().input_scattered
+            and isinstance(hidden_states, torch.Tensor)
+            and hidden_states.ndim == 2
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] in (5, 40, 320)
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            from sglang.srt.models.kimi_k3_amd.mla_gemm import mla_linear
+
+            merged = mla_linear(hidden_states, self._mla_a_gate_weight)
+            self._mla_gate_precomputed = merged[:, 2112:]
+            return merged[:, :2112]
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
+
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
         from torch.nn.parameter import UninitializedParameter
@@ -2848,6 +2909,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
+        # Latent preparation is lazy: do not fork a duplicate gate projection
+        # before the merged projection has produced its gate slice.
+        if getattr(self, "_mla_a_gate_weight", None) is not None:
+            return
         if (
             self._gate_alt_stream is not None
             and get_is_capture_mode()
@@ -2860,6 +2925,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_pending_stream = alt
 
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_mla_gate_precomputed", None) is not None:
+            gate = self._mla_gate_precomputed
+            self._mla_gate_precomputed = None
+            return gate
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
         pre = self.__dict__.get("_mono_pre") if _is_gfx95 else None
@@ -4106,6 +4175,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+            if isinstance(layer.self_attn, KimiK3MLAAttention):
+                layer.self_attn._merge_mla_a_gate_weights()
             if (
                 isinstance(layer.self_attn, KimiK3MLAAttention)
                 and layer.self_attn.indexer is not None

@@ -604,6 +604,8 @@ class DeepseekMLARocmForwardMixin:
         )
         q_lora = None
         topk_indices = None
+        k31_cache_saved = False
+        k31_q_cat = None
         # A monokernel plugin that already ran the projection front (fused_qkv_a,
         # the q / kv norms, q_b: ``_mono_pre``) hands its outputs in.
         pre = self.__dict__.get("_mono_pre")
@@ -635,8 +637,17 @@ class DeepseekMLARocmForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
+            fused_norm = None
+            if getattr(self, "_k31_mla_fuse", False):
+                from sglang.srt.models.kimi_k3_amd.mla_fuse import try_norm_cache
+
+                fused_norm = try_norm_cache(self, q, latent_cache, forward_batch)
             # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
+            if fused_norm is not None:
+                q, latent_cache = fused_norm
+                k_nope = latent_cache[..., : self.kv_lora_rank]
+                k31_cache_saved = True
+            elif self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 q = self.q_a_layernorm(q)
@@ -845,6 +856,22 @@ class DeepseekMLARocmForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
+            elif (
+                k31_cache_saved
+                and self.num_local_heads == 12
+                and self.w_kc.dtype == torch.bfloat16
+                and isinstance(self.w_scale, (int, float))
+                and self.w_scale == 1.0
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not is_kv_b_lora_active(self)
+                and llama_4_scaling is None
+            ):
+                from sglang.kernels.ops.attention.dsa.mla_v_absorb import (
+                    mla_q_absorb_cat,
+                )
+
+                k31_q_cat = mla_q_absorb_cat(q, self.w_kc)
+                q_nope_out = k31_q_cat[..., : self.kv_lora_rank].transpose(0, 1)
             elif fuse_bmm_rope_cache:
                 # The absorb is the first half of the kernel core will run, and
                 # that kernel wants q_nope un-absorbed. Nothing to do here.
@@ -913,6 +940,9 @@ class DeepseekMLARocmForwardMixin:
             topk_indices,
             llama_4_scaling,
             q_nope if fuse_bmm_rope_cache else None,
+            k31_cache_saved,
+            k31_q_cat,
+            latent_cache.view(-1, 1, 576) if k31_cache_saved else None,
         )
 
     def _applies_rope_in_prepare(
@@ -962,10 +992,41 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
         q_nope_unabsorbed=None,
+        k31_cache_saved=False,
+        k31_q_cat=None,
+        k31_kv=None,
     ):
-        save_kv_cache = True
+        save_kv_cache = not k31_cache_saved
 
-        if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+        if k31_q_cat is not None:
+            # Prebuilt token-major Q: DSA can use it without another concat/copy.
+            if (
+                self.current_attention_backend
+                not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+            ):
+                attn_output = self.attn_mqa(
+                    k31_q_cat,
+                    k31_kv,
+                    k_nope,
+                    forward_batch,
+                    save_kv_cache=False,
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    k31_q_cat,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=None,
+                    k_rope=k_pe,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+        elif self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
                 if q_nope_unabsorbed is not None:
                     # prepare left the absorb to us: one kernel for the BMM,
@@ -1070,6 +1131,7 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        save_kv_cache=save_kv_cache,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)
@@ -1228,7 +1290,36 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            # K3-only hook. LoRA corrections must precede the gate, so retain the
+            # original sequence whenever a correction or quantized weight is active.
+            fused_gate = (
+                getattr(self, "_k31_mla_fuse", False)
+                and self.dcp_size == 1
+                and 0 < attn_output.shape[0] <= 320
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not is_kv_b_lora_active(self)
+                and attn_output.dtype == torch.bfloat16
+                and attn_output.stride(-1) == 1
+                and self.w_vc.dtype == torch.bfloat16
+                and self.o_proj.weight.dtype == torch.bfloat16
+                and isinstance(self.w_scale, (int, float))
+                and self.w_scale == 1.0
+                and getattr(self, "_gate_hidden_states", None) is not None
+            )
+            if fused_gate:
+                from sglang.kernels.ops.attention.dsa.mla_v_absorb import (
+                    mla_v_absorb_gate,
+                )
+
+                gate = self._compute_output_gate(self._gate_hidden_states)
+                attn_bmm_output = mla_v_absorb_gate(attn_output, self.w_vc, gate)
+                self._gate_hidden_states = None
+            else:
+                attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (

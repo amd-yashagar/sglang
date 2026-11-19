@@ -151,6 +151,22 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         for got, ref in zip(overlap, serial):
             self.assertTrue(torch.equal(got, ref))
 
+    def test_mla_merged_gate_is_lazy_and_consumed_once(self):
+        owner = SimpleNamespace(
+            _mla_a_gate_weight=torch.empty(1),
+            _mla_gate_precomputed=None,
+            _gate_pending_stream=None,
+        )
+        hidden = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
+        # The latent input is prepared after forward() forks ordinary gates.
+        # Merged weights must suppress that fork before the gate slice exists.
+        KimiK3MLAAttention._fork_output_gate(owner, hidden)
+        self.assertIsNone(owner._gate_pending_stream)
+        gate = hidden[:, :32]
+        owner._mla_gate_precomputed = gate
+        self.assertIs(KimiK3MLAAttention._compute_output_gate(owner, hidden), gate)
+        self.assertIsNone(owner._mla_gate_precomputed)
+
     def test_mla_gate_capture_matches_serial(self):
         x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
         qkv_weight = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
