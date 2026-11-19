@@ -22,8 +22,9 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
 )
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import ReductionOp, T
 
 WAVE_SIZE = 64
@@ -218,7 +219,7 @@ def _compile_norm_qb(a_stride: int, loc64: bool = True):
                     llvm.InlineAsmOp(
                         None,
                         [lds_p, vofs[i].ir_value(), rsrc, chunk_soff[j].ir_value()],
-                        "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, $3 offen"
+                        "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, $3 offen"  # codespell:ignore offen
                         + cpol
                         + " lds",
                         "s,v,s,s",
