@@ -104,7 +104,12 @@ def aiter_paged_mqa_logits(
     kv_block_size: int,
     persistent_schedule: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    try:
+        from aiter.ops.triton.attention.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits,
+        )
+    except ModuleNotFoundError:
+        from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     q_fp8 = q_fp8.unsqueeze(1)
     batch_size, next_n, _, _ = q_fp8.shape
@@ -138,9 +143,14 @@ def aiter_paged_mqa_logits_persistent_schedule(
 ) -> torch.Tensor:
     """Work table that splits every row's chunks evenly over the grid by its real length
     (one query row per entry of seq_lens); built on the device, so graph-safe."""
-    from aiter.ops.triton.pa_mqa_logits import (
-        deepgemm_fp8_paged_mqa_logits_persistent_schedule,
-    )
+    try:
+        from aiter.ops.triton.attention.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits_persistent_schedule,
+        )
+    except ModuleNotFoundError:
+        from aiter.ops.triton.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits_persistent_schedule,
+        )
 
     return deepgemm_fp8_paged_mqa_logits_persistent_schedule(
         seq_lens.shape[0], 1, seq_lens, max_seq_len
@@ -160,12 +170,40 @@ def aiter_paged_mqa_logits_verify(
     next_n: int,
     kv_block_size: int,
 ) -> torch.Tensor:
-    """Target-verify logits with Q as [B, next_n] rows, so a request's draft rows share
-    one pass over its index-K pages.
+    """Target-verify logits with Q as [B, next_n] rows. The optional native
+    gfx950 kernel reuses each index-K load across all five draft rows.
 
     Row n of a request scores keys up to its last row's length - next_n + n; the top-k
     bounds every row by its own length."""
-    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    from sglang.kernels.ops.attention.dsa.gfx950_mqa_logits import (
+        gfx950_paged_mqa_logits,
+        use_grouped_mqa,
+    )
+
+    grouped_q = q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2])
+    if kv_block_size == 64 and use_grouped_mqa(
+        grouped_q,
+        kv_cache_fp8,
+        weights[:q_offset],
+        request_lens,
+        request_block_tables,
+        max_seq_len,
+    ):
+        return gfx950_paged_mqa_logits(
+            grouped_q,
+            kv_cache_fp8,
+            weights[:q_offset],
+            request_lens,
+            request_block_tables,
+            max_seq_len,
+        )
+
+    try:
+        from aiter.ops.triton.attention.pa_mqa_logits import (
+            deepgemm_fp8_paged_mqa_logits,
+        )
+    except ModuleNotFoundError:
+        from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
     logits = torch.empty(
         (q_offset, max_seq_len), device=q_fp8.device, dtype=torch.float32

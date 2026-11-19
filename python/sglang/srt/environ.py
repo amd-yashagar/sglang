@@ -2144,6 +2144,9 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Experimental gfx950 grouped-five-query FP8 verify kernel (prebuilt only).
+    SGLANG_DSA_GFX950_GROUPED_MQA = EnvBool(False)
+    SGLANG_DSA_INDEXER_HIP_LIB = EnvStr(None)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Shard the ratio-1/2 index sources' dense prefill scores across the
     # attention-TP group and all-gather the selections, instead of every rank
