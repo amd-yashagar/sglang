@@ -18,18 +18,18 @@ if "TMPDIR" not in os.environ:
     (ROOT / "tmp").mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str((ROOT / "tmp").resolve())
 os.environ.setdefault("TRITON_CACHE_DIR", str(ROOT / "triton-cache"))
+os.environ.setdefault("FLYDSL_RUNTIME_CACHE_DIR", str(ROOT / "flydsl-cache"))
+os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "1")
 os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(ROOT / "torch-extensions"))
 os.environ.setdefault("MAX_JOBS", str(os.cpu_count()))
 os.environ.setdefault("SGLANG_JIT_CACHE_DIR", str(ROOT / "sglang-jit"))
 
-import torch
-
 import aiter.ops.triton.attention.pa_mqa_logits as pa
-
+import torch
 from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
     aiter_paged_mqa_logits,
-    aiter_paged_mqa_logits_verify,
     aiter_paged_mqa_logits_persistent_schedule,
+    aiter_paged_mqa_logits_verify,
 )
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2, topk_transform_paged_v2
 
@@ -51,11 +51,11 @@ def compiled_schedule(batch):
     # Explicit target, no driver/device discovery. Identical AITER metadata body;
     # integer scalar specialization is intentionally disabled (not timed).
     import triton
-    from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits_persistent_schedule as kernel,
     )
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
 
     return triton.compile(
         ASTSource(
@@ -94,6 +94,7 @@ def install_schedule():
 
 def build_only():
     import subprocess
+
     from sglang.kernels.ops.attention.dsa import gfx950_mqa_logits
 
     assert all(
@@ -136,6 +137,7 @@ def build_only():
     # reuse exactly the existing top-k source/wrappers/flags (no kernel changes).
     from contextlib import ExitStack
     from unittest.mock import patch
+
     from sglang.kernels.jit.utils.arch import CompileArch
     from sglang.kernels.jit.utils.compile import cache, loader, toolchain
 
@@ -177,6 +179,48 @@ def build_only():
                 ("topk_" + name, "TopKKernel<false>::" + name) for name in exports
             ],
         )
+    # Build the existing AITER grouped FlyDSL body at the real query count.
+    # Meta tensors and explicit gfx950 target; no live-device discovery.
+    import flydsl.compiler as flyc
+    from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx950 import _compile
+
+    os.environ["COMPILE_ONLY"] = "1"
+    os.environ["FLYDSL_GPU_ARCH"] = "gfx950"
+    try:
+        for n in range(1, 9):
+
+            def meta(shape, dtype):
+                return torch.empty(shape, dtype=dtype, device="meta")
+
+            b, width = 16, 131072
+            q = meta((b, n, 32, 128), torch.float8_e4m3fn)
+            kv = meta((b * (width // 64) * 8448,), torch.uint8)
+            w = meta((b * n, 32), torch.float32)
+            out = meta((b * n, width), torch.float32)
+            lens = meta((b,), torch.int32)
+            table = meta((b, width // 64), torch.int32)
+            for ctx_stride in {1, n}:
+                ctx = lens if ctx_stride == 1 else meta((b, n), torch.int32)
+                flyc.compile(
+                    _compile(ctx_stride, n),
+                    q,
+                    kv,
+                    w,
+                    out,
+                    ctx,
+                    table,
+                    lens,
+                    1024,
+                    b,
+                    64,
+                    n,
+                    0,
+                    n * 4096,
+                    width // 64,
+                    width,
+                )
+    finally:
+        os.environ.pop("COMPILE_ONLY", None)
     print("CPU builds complete", flush=True)
 
 
@@ -193,6 +237,7 @@ def reject_runtime_compilation():
 
     ninja.build = reject
     os.environ["SGLANG_CRASH_ON_JIT_COMPILE"] = "1"
+    os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
 
 
 def cold_graph_us(fn, flush, samples=9):
@@ -266,6 +311,24 @@ def topk_check(scores, indices, lens, label, strict=True):
     }
 
 
+def fp64_reference(inp, length):
+    """Independent dequantized reference; optional and never timed."""
+    q = inp["q_fp8"].double()
+    b, n, _, d = q.shape
+    raw = inp["kv_raw"].reshape(inp["kv_raw"].shape[0], -1)
+    keys = raw[:, : 64 * d].contiguous().view(torch.float8_e4m3fn).double()
+    scales = raw[:, 64 * d :].contiguous().view(torch.float32).double()
+    kv = keys.view(-1, 64, d) * scales.view(-1, 64, 1)
+    pos = torch.arange(length, device=q.device)
+    table = inp["kv_indices"][:, pos // 64]
+    result = torch.empty((b * n, length), dtype=torch.float64, device=q.device)
+    for batch in range(b):
+        dots = torch.einsum("nhd,pd->nhp", q[batch], kv[table[batch], pos % 64]).relu()
+        weights = inp["weights"][batch * n : (batch + 1) * n].double()
+        result[batch * n : (batch + 1) * n] = (dots * weights[:, :, None]).sum(1)
+    return result
+
+
 def run_case(batch, next_n, length, args, flush):
     inp = helpers.build_inputs(
         (batch, next_n, 32, 128, 64, True),
@@ -320,25 +383,34 @@ def run_case(batch, next_n, length, args, flush):
                 kv_block_size=64,
             )
 
-    def with_flag(value):
-        old = os.environ.get("SGLANG_DSA_GFX950_GROUPED_MQA")
-        os.environ["SGLANG_DSA_GFX950_GROUPED_MQA"] = value
+    def with_flag(value, flydsl="0"):
+        names = ("SGLANG_DSA_GFX950_GROUPED_MQA", "SGLANG_DSA_GFX950_FLYDSL_MQA")
+        previous = {name: os.environ.get(name) for name in names}
+        os.environ[names[0]], os.environ[names[1]] = value, flydsl
         try:
             return compute_logits()
         finally:
-            if old is None:
-                os.environ.pop("SGLANG_DSA_GFX950_GROUPED_MQA", None)
-            else:
-                os.environ["SGLANG_DSA_GFX950_GROUPED_MQA"] = old
+            for name, old in previous.items():
+                if old is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = old
 
     variants = {"baseline": lambda: with_flag("0")}
     if args.candidate:
         variants["candidate"] = lambda: with_flag("1")
+    if args.flydsl:
+        variants["v2"] = lambda: with_flag("1", "1")
     ref = helpers.run_torch(inp, length)
     # The existing helper assumes uniform causal lengths; apply ragged bounds.
     ref.masked_fill_(
         torch.arange(length, device="cuda")[None, :] >= lens[:, None], -float("inf")
     )
+    ref64 = fp64_reference(inp, length) if args.fp64_reference else None
+    if ref64 is not None:
+        ref64.masked_fill_(
+            torch.arange(length, device="cuda")[None, :] >= lens[:, None], -float("inf")
+        )
     result = {
         "batch": batch,
         "next_n": next_n,
@@ -364,6 +436,7 @@ def run_case(batch, next_n, length, args, flush):
     result["k_roof_us"] = kbytes / 6e6
     result["pipeline_roof_us"] = total_bytes / 6e6
     baseline_scores = None
+    baseline_error = None
     for name, fn in variants.items():
         logits = fn()
         valid = torch.arange(length, device="cuda")[None, :] < lens[:, None]
@@ -372,6 +445,15 @@ def run_case(batch, next_n, length, args, flush):
         if baseline_scores is None:
             baseline_scores = a.clone()
         baseline_max_diff = float((a - baseline_scores).abs().max())
+        max_error = float((a - b).abs().max())
+        if baseline_error is None:
+            baseline_error = max_error
+        assert max_error <= baseline_error + 1e-4, (
+            name,
+            "Exceeds existing kernel error",
+            max_error,
+            baseline_error,
+        )
         diff = helpers.calc_diff(a, b)
         assert diff < 1e-3, (name, "calc_diff", diff)
         # Same per-element bound as the existing aiter benchmark.
@@ -388,6 +470,11 @@ def run_case(batch, next_n, length, args, flush):
         )
         fp32_membership = topk_check(
             ref, out, lens, name + ":fp32_reference", strict=False
+        )
+        fp64_membership = (
+            topk_check(ref64, out, lens, name + ":fp64_reference", strict=False)
+            if ref64 is not None
+            else None
         )
         # Exercise the actual physical page-table transform as well as raw membership.
         physical = torch.empty_like(out)
@@ -418,9 +505,17 @@ def run_case(batch, next_n, length, args, flush):
             "max_diff_from_baseline": baseline_max_diff,
             "topk_exact_mod_ties": True,
             "fp32_membership": fp32_membership,
+            "fp64_membership": fp64_membership,
+            "max_abs_fp64_error": (
+                float((a - ref64.masked_fill(~valid, 0)).abs().max())
+                if ref64 is not None
+                else None
+            ),
             "baseline_membership": baseline_membership,
             "pipeline_kind": (
-                "grouped_logits_topk_v2"
+                "flydsl_or_retained_v1_logits_topk_v2"
+                if name == "v2"
+                else "grouped_logits_topk_v2"
                 if name == "candidate"
                 and next_n == 5
                 and width >= 32768
@@ -441,8 +536,18 @@ def main():
         "--cases", nargs="*", help="batch:next_n:context; default full requested matrix"
     )
     parser.add_argument("--candidate", action="store_true")
+    parser.add_argument(
+        "--flydsl",
+        action="store_true",
+        help="Compare v2 FlyDSL plus retained v1 regimes",
+    )
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--ragged", action="store_true")
+    parser.add_argument(
+        "--fp64-reference",
+        action="store_true",
+        help="Also audit membership against independent float64 math",
+    )
     parser.add_argument(
         "--layers",
         type=int,

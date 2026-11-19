@@ -7,6 +7,10 @@ Set SGLANG_DSA_INDEXER_HIP_LIB to that library and opt in with
 SGLANG_DSA_GFX950_GROUPED_MQA=1. No compilation occurs in this module.
 Lengths must be between next_n-1 and width, as in the AITER verify contract.
 Only positions below each causal row length are defined.
+
+SGLANG_DSA_GFX950_FLYDSL_MQA=1 additionally reuses AITER grouped FlyDSL
+for long-context decode/verify. CPU-precompile with the existing indexer bench
+before capture; both flags are off by default.
 """
 
 import ctypes
@@ -26,15 +30,15 @@ def _library(path: str):
     return lib
 
 
-def grouped_mqa_supported(q, cache, weights, lens, tables, width):
+def _paged_mqa_supported(q, cache, weights, lens, tables, width, next_n):
     return (
         q.ndim == 4
-        and q.shape[1:] == (5, 32, 128)
+        and q.shape[1:] == (next_n, 32, 128)
         and q.dtype == torch.float8_e4m3fn
         and cache.ndim == 4
         and cache.shape[1:] == (64, 1, 132)
         and cache.dtype in (torch.uint8, torch.float8_e4m3fn)
-        and weights.shape == (q.shape[0] * 5, 32)
+        and weights.shape == (q.shape[0] * next_n, 32)
         and weights.dtype == torch.float32
         and lens.shape == (q.shape[0],)
         and lens.dtype == torch.int32
@@ -49,6 +53,83 @@ def grouped_mqa_supported(q, cache, weights, lens, tables, width):
             for t in (q, cache, weights, lens, tables)
         )
         and all(t.data_ptr() % 16 == 0 for t in (q, cache, weights))
+    )
+
+
+def grouped_mqa_supported(q, cache, weights, lens, tables, width):
+    return _paged_mqa_supported(q, cache, weights, lens, tables, width, 5)
+
+
+def use_flydsl_mqa(q, cache, weights, lens, tables, width):
+    # Retain persistent Gluon at B1/32K and native v1 at B64+/128K verify.
+    # Eligibility uses the padded host width, never synchronizes device lengths.
+    return (
+        os.getenv("SGLANG_DSA_GFX950_FLYDSL_MQA", "0") == "1"
+        and q.ndim == 4
+        and q.shape[0] > 0
+        and q.shape[1] in (1, 5)
+        and width >= 32768
+        and (q.shape[0] >= 8 or width >= 131072)
+        and not (q.shape[1] == 5 and q.shape[0] >= 64 and width >= 131072)
+        and _paged_mqa_supported(q, cache, weights, lens, tables, width, q.shape[1])
+        and torch.version.hip is not None
+        and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0]
+        == "gfx950"
+    )
+
+
+def gfx950_flydsl_paged_mqa_logits(q, cache, weights, lens, tables, width, *, out=None):
+    """Reuse the AITER grouped scorer; precompile before graph capture/benchmarking.
+
+    Pair with SGLANG_DSA_GFX950_GROUPED_MQA=1 to retain v1 in the large-batch
+    128K verify regime. Only causal positions are defined in the output.
+    """
+    if (
+        q.ndim != 4
+        or q.shape[1] not in (1, 5)
+        or not _paged_mqa_supported(q, cache, weights, lens, tables, width, q.shape[1])
+    ):
+        raise ValueError(
+            "FlyDSL MQA requires contiguous FP8 Bx{1,5}x32x128 queries and page64 cache"
+        )
+    if (
+        torch.version.hip is None
+        or torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0]
+        != "gfx950"
+    ):
+        raise ValueError("FlyDSL MQA requires gfx950")
+    shape = (q.shape[0] * q.shape[1], width)
+    if out is None:
+        out = torch.empty(shape, device=q.device, dtype=torch.float32)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.float32
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("Invalid FlyDSL MQA output")
+    if not q.shape[0]:
+        return out
+    from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx950 import (
+        flydsl_fp8_paged_mqa_logits,
+    )
+
+    # Target four workgroups/CU; query-count specialization reduces LDS
+    # from 50,688 to 38,016 (N5) or 21,120 (N1) bytes. Explicit split avoids the
+    # AITER auto-split .item(), and is safe when captured lengths change.
+    splits = min(tables.shape[1], (1024 + q.shape[0] - 1) // q.shape[0])
+    return flydsl_fp8_paged_mqa_logits(
+        q,
+        cache,
+        weights,
+        out,
+        lens,
+        tables,
+        width,
+        Preshuffle=True,
+        KVBlockSize=64,
+        SplitKV=splits,
+        TotalCuCount=256,
     )
 
 

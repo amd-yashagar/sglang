@@ -113,6 +113,21 @@ def aiter_paged_mqa_logits(
 
     q_fp8 = q_fp8.unsqueeze(1)
     batch_size, next_n, _, _ = q_fp8.shape
+    from sglang.kernels.ops.attention.dsa.gfx950_mqa_logits import (
+        gfx950_flydsl_paged_mqa_logits,
+        use_flydsl_mqa,
+    )
+
+    if (
+        preshuffle
+        and kv_block_size == 64
+        and use_flydsl_mqa(
+            q_fp8, kv_cache_fp8, weights, seq_lens, block_tables, max_seq_len
+        )
+    ):
+        return gfx950_flydsl_paged_mqa_logits(
+            q_fp8, kv_cache_fp8, weights, seq_lens, block_tables, max_seq_len
+        )
     logits = torch.empty(
         (batch_size * next_n, max_seq_len),
         device=q_fp8.device,
@@ -176,11 +191,29 @@ def aiter_paged_mqa_logits_verify(
     Row n of a request scores keys up to its last row's length - next_n + n; the top-k
     bounds every row by its own length."""
     from sglang.kernels.ops.attention.dsa.gfx950_mqa_logits import (
+        gfx950_flydsl_paged_mqa_logits,
         gfx950_paged_mqa_logits,
+        use_flydsl_mqa,
         use_grouped_mqa,
     )
 
     grouped_q = q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2])
+    if kv_block_size == 64 and use_flydsl_mqa(
+        grouped_q,
+        kv_cache_fp8,
+        weights[:q_offset],
+        request_lens,
+        request_block_tables,
+        max_seq_len,
+    ):
+        return gfx950_flydsl_paged_mqa_logits(
+            grouped_q,
+            kv_cache_fp8,
+            weights[:q_offset],
+            request_lens,
+            request_block_tables,
+            max_seq_len,
+        )
     if kv_block_size == 64 and use_grouped_mqa(
         grouped_q,
         kv_cache_fp8,
