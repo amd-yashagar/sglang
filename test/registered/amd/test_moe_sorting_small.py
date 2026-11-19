@@ -1,11 +1,14 @@
 """Small-batch MoE sorting patch (sglang.kernels.ops.moe.moe_sorting_small) vs stock aiter sorting."""
 
+import os
 import unittest
 
-import torch
+# These kernel-only tests need no serving/transformers test dependencies.
+from unittest import TestCase as CustomTestCase
+from unittest.mock import patch
 
+import torch
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=80, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
@@ -26,7 +29,6 @@ class TestMoeSortingSmall(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         import aiter.fused_moe as fm
-
         from sglang.kernels.ops.moe import moe_sorting_small as S
 
         cls.S = S
@@ -136,15 +138,20 @@ class TestMoeSortingSmall(CustomTestCase):
 def _reference(ids, w, num_experts, block_size):
     m, topk = ids.shape
     flat = ids.flatten().tolist()
+    flat_w = w.flatten().tolist()
+    buckets = [[] for _ in range(num_experts)]
+    for p, e in enumerate(flat):
+        if 0 <= e < num_experts:
+            buckets[e].append(p)
     sorted_ids, sorted_w, expert_ids = [], [], []
     for e in range(num_experts):
-        pairs = [p for p, x in enumerate(flat) if x == e]
+        pairs = buckets[e]
         if not pairs:
             continue
         n = -(-len(pairs) // block_size) * block_size
         sorted_ids += [((p % topk) << 24) | (p // topk) for p in pairs]
         sorted_ids += [(topk << 24) | m] * (n - len(pairs))
-        sorted_w += [w.flatten()[p].item() for p in pairs] + [0.0] * (n - len(pairs))
+        sorted_w += [flat_w[p] for p in pairs] + [0.0] * (n - len(pairs))
         expert_ids += [e] * (n // block_size)
     return sorted_ids, sorted_w, expert_ids
 
@@ -199,7 +206,6 @@ class TestMoeSortQuant(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         import aiter.fused_moe as fm
-
         from sglang.kernels.ops.moe import moe_sorting_small as S
 
         if not S.apply_aiter_small_moe_sort_patch():
@@ -349,6 +355,145 @@ class TestMoeSortQuant(CustomTestCase):
         finally:
             S._emitted_fp4_quant.reset(etok)
             S._pending_fp4_input.reset(tok)
+
+
+@unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
+class TestK3PackedRouteSort(CustomTestCase):
+    """K3 fused glue vs existing aiter routing, stable sort oracle and MXFP8.
+
+    Compare only live scale slots: aiter deliberately leaves padding undefined.
+    TP8 is tensor parallel, not expert parallel; one_rank stresses a concentrated
+    112-expert range without changing the global expert-id layout.
+    """
+
+    def setUp(self):
+        env = patch.dict(os.environ, {"SGLANG_K3_ROUTE_SORT_FAST": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _check(self, m, n, pattern, graph=False, dtype=torch.bfloat16):
+        import aiter
+        import aiter.fused_moe as fm
+        from sglang.kernels.ops.moe.k3_route_sort_fast import route_sort_quant
+        from sglang.kernels.ops.moe.k3_route_sort_mid import counts_buffer
+
+        torch.manual_seed(10000 + m)
+        logits = torch.randn(m, 992, device="cuda", dtype=dtype)[:, 32:928]
+        bias = (torch.randn(896, device="cuda") * 0.03).to(dtype)
+        if pattern == "underflow":
+            logits.fill_(-1000)
+        elif pattern == "ties":
+            logits.zero_()
+            bias.zero_()
+        elif pattern == "skew":
+            bias[:16] += 4
+        elif pattern == "one_rank":
+            bias[784:] += 4
+        # Row-strided views model the fused front GEMM split, not just dense inputs.
+        backing = torch.randn(m, n + 96, dtype=torch.bfloat16, device="cuda")
+        x = backing[:, 32 : 32 + n]
+        x[:, :32] = 0
+        x[:, 32:64] *= 100
+        ids = torch.empty(m, 16, dtype=torch.int32, device="cuda")
+        w = torch.empty(m, 16, device="cuda")
+        ri, rw = torch.empty_like(ids), torch.empty_like(w)
+        aiter.biased_grouped_topk(logits, bias, rw, ri, 1, 1, True)
+        blocks = (m * 16 + 896 * 32 - 16 + 31) // 32
+        out = (
+            torch.empty(blocks * 32, dtype=torch.int32, device="cuda"),
+            torch.empty(blocks * 32, device="cuda"),
+            torch.empty(blocks, dtype=torch.int32, device="cuda"),
+            torch.empty(2, dtype=torch.int32, device="cuda"),
+            torch.ones(m, n, dtype=torch.bfloat16, device="cuda"),
+        )
+
+        def run():
+            return route_sort_quant(logits, bias, x, ids, w, out)
+
+        q, scale = run()
+        if graph:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                q, scale = run()
+            for _ in range(5):
+                g.replay()
+        msg = f"m={m} n={n} {pattern}"
+        self.assertTrue(torch.equal(ids, ri), msg + " expert ids")
+        self.assertTrue(torch.equal(w, rw), msg + " routing weights")
+        refs = _reference(ri.cpu(), rw.cpu(), 896, 32)
+        valid = len(refs[0])
+        self.assertEqual(out[3].tolist(), [valid, m], msg)
+        self.assertEqual(out[0][:valid].tolist(), refs[0], msg + " stable ids")
+        self.assertEqual(out[1][:valid].tolist(), refs[1], msg + " sorted weights")
+        self.assertEqual(out[2][: valid // 32].tolist(), refs[2], msg + " experts")
+        self.assertTrue(bool((out[4] == 0).all()), msg + " zero moe_buf")
+        from sglang.kernels.ops.moe.k3_route_sort_fast import _BITMAPS
+
+        for bitmap in _BITMAPS.values():
+            self.assertTrue(bool((bitmap == 0).all()), msg + " bitmap reset")
+        self.assertTrue(
+            bool((counts_buffer(x.device, "fast", 896) == 0).all()), msg + " reset"
+        )
+        rq, rs = fm.fused_dynamic_mxfp8_quant_moe_sort(
+            x,
+            out[0],
+            out[3],
+            m,
+            16,
+            32,
+            sorted_weights=out[1],
+            num_experts_upper_bound=896,
+        )
+        self.assertTrue(
+            torch.equal(q.view(torch.uint8), rq.view(torch.uint8)), msg + " fp8 codes"
+        )
+        rows = torch.arange(valid, device="cuda")[(out[0][:valid] & 0xFFFFFF) < m][
+            :, None
+        ]
+        y = torch.arange(n // 32, device="cuda")[None, :]
+        pad = ((n // 32 + 7) // 8) * 8
+        addr = (
+            (rows // 32) * (pad * 32)
+            + (y // 8) * 256
+            + (y % 4) * 64
+            + (rows % 16) * 4
+            + ((y % 8) // 4) * 2
+            + (rows % 32) // 16
+        )
+        self.assertTrue(
+            torch.equal(
+                scale.view(torch.uint8).flatten()[addr],
+                rs.view(torch.uint8).flatten()[addr],
+            ),
+            msg + " scale bytes",
+        )
+
+    def test_target_shapes(self):
+        for n in (3584, 7168):
+            for m in (1, 5, 8, 40, 64, 320):
+                for pattern in ("random", "skew", "ties", "one_rank", "underflow"):
+                    with self.subTest(m=m, n=n, pattern=pattern):
+                        self._check(m, n, pattern, graph=True)
+
+    def test_opt_in_required(self):
+        from sglang.kernels.ops.moe.k3_route_sort_fast import route_sort_quant
+
+        with (
+            patch.dict(os.environ, {"SGLANG_K3_ROUTE_SORT_FAST": "0"}),
+            self.assertRaisesRegex(RuntimeError, "SGLANG_K3_ROUTE_SORT_FAST"),
+        ):
+            route_sort_quant(None, None, None, None, None, None)
+
+    def test_fp32_router(self):
+        for m in (1, 5, 8, 40, 64, 320):
+            for pattern in ("random", "ties", "skew", "one_rank", "underflow"):
+                with self.subTest(m=m, pattern=pattern):
+                    self._check(m, 3584, pattern, graph=True, dtype=torch.float32)
+
+    def test_every_m(self):
+        for m in range(1, 321):
+            with self.subTest(m=m):
+                self._check(m, 3584, "random")
 
 
 if __name__ == "__main__":

@@ -213,6 +213,8 @@ def _k3_mid_sort_kernel(
     MOE_BUF_ZERO: tl.constexpr,
     BUF_COLS: tl.constexpr,
     BUF_CHUNK: tl.constexpr,
+    bitmap_ptr=None,
+    BITMAP_WORDS: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
@@ -226,9 +228,36 @@ def _k3_mid_sort_kernel(
     mx = offs_x < E
     cnt_x = tl.load(counts_ptr + offs_x, mask=mx & (pid >= M), other=0)
 
+    if BITMAP_WORDS:
+        t = tl.minimum(pid, M - 1)
+        offs_k = tl.arange(0, TOPK)
+        ek = tl.load(topk_ids_ptr + t * TOPK + offs_k)
+        # One bit per (expert, token). Count previous tokens in 32-token
+        # words, not all TOPK expert ids of every previous token.
+        word = tl.arange(0, BITMAP_WORDS)
+        bits = tl.load(bitmap_ptr + ek[:, None] * BITMAP_WORDS + word[None, :]).to(
+            tl.uint32
+        )
+        before = tl.where(
+            word < t // 32, -1, tl.where(word == t // 32, (1 << (t % 32)) - 1, 0)
+        ).to(tl.uint32)
+        rank = tl.sum(
+            tl.inline_asm_elementwise(
+                "v_bcnt_u32_b32 $0, $1, 0",
+                constraints="=v,v",
+                args=[bits & before[None, :]],
+                dtype=tl.uint32,
+                is_pure=True,
+                pack=1,
+            ).to(tl.int32),
+            axis=1,
+        )
+
     # ticket: the last CTA re-zeroes counts; the data-dependent increment keeps
     # the counts reads ahead of the atomic
     dep = tl.sum(cnt, axis=0) + tl.sum(cnt_x, axis=0)
+    if BITMAP_WORDS:
+        dep += tl.sum(rank, axis=0)
     offs_one = tl.arange(0, 2)
     tick = tl.atomic_add(
         counts_ptr + E_POW2 + offs_one * 0,
@@ -244,12 +273,13 @@ def _k3_mid_sort_kernel(
         ek = tl.load(topk_ids_ptr + t * TOPK + offs_k)
         wk = tl.load(topk_weights_ptr + t * TOPK + offs_k)
         # stable rank: pairs of earlier tokens on the same expert
-        rank = tl.zeros((TOPK,), tl.int32)
-        n_prev = t * TOPK
-        for s in range(0, n_prev, RANK_TILE):
-            offs_p = s + tl.arange(0, RANK_TILE)
-            ep = tl.load(topk_ids_ptr + offs_p, mask=offs_p < n_prev, other=-1)
-            rank += tl.sum((ep[None, :] == ek[:, None]).to(tl.int32), axis=1)
+        if not BITMAP_WORDS:
+            rank = tl.zeros((TOPK,), tl.int32)
+            n_prev = t * TOPK
+            for s in range(0, n_prev, RANK_TILE):
+                offs_p = s + tl.arange(0, RANK_TILE)
+                ep = tl.load(topk_ids_ptr + offs_p, mask=offs_p < n_prev, other=-1)
+                rank += tl.sum((ep[None, :] == ek[:, None]).to(tl.int32), axis=1)
         bb_all = tl.cumsum(nb, axis=0) - nb
         bb_k = tl.gather(bb_all, ek, axis=0)
         dest = bb_k * BLOCK_SIZE + rank
@@ -310,6 +340,9 @@ def _k3_mid_sort_kernel(
     if last:
         tl.store(counts_ptr + offs_e, tl.zeros((E_POW2,), tl.int32), mask=me)
         tl.store(counts_ptr + E_POW2, 0)
+        if BITMAP_WORDS:
+            b = tl.arange(0, E_POW2 * BITMAP_WORDS)
+            tl.store(bitmap_ptr + b, 0, b < E * BITMAP_WORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +398,7 @@ class RouteState:
     exps: torch.Tensor
     counts: torch.Tensor
     consumed: bool = False
+    bitmap: torch.Tensor | None = None
 
 
 def route_quant(
@@ -463,10 +497,14 @@ def sort_scatter(
         G_POW2=triton.next_power_of_2(g),
         SCALEN_PAD=scalen_pad,
         RANK_TILE=1024,
-        ZERO_W_SCALE=m * topk <= _AITER_FUSED_QUANT_PAIRS,
+        # The packed path is stage1: one shared fp8 row per token. Current
+        # aiter only zeroes a zero-weight row when each route owns that row.
+        ZERO_W_SCALE=m * topk <= _AITER_FUSED_QUANT_PAIRS and state.bitmap is None,
         MOE_BUF_ZERO=buf_zero,
         BUF_COLS=buf_cols,
         BUF_CHUNK=min(1024, triton.next_power_of_2(buf_cols)),
+        bitmap_ptr=state.bitmap,
+        BITMAP_WORDS=state.bitmap.shape[1] if state.bitmap is not None else 0,
         num_warps=4,
     )
     state.consumed = True
