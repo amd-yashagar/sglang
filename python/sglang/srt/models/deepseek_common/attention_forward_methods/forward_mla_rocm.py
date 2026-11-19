@@ -606,6 +606,7 @@ class DeepseekMLARocmForwardMixin:
         topk_indices = None
         k31_cache_saved = False
         k31_q_cat = None
+        k31_q_b = None
         # A monokernel plugin that already ran the projection front (fused_qkv_a,
         # the q / kv norms, q_b: ``_mono_pre``) hands its outputs in.
         pre = self.__dict__.get("_mono_pre")
@@ -644,7 +645,7 @@ class DeepseekMLARocmForwardMixin:
                 fused_norm = try_norm_cache(self, q, latent_cache, forward_batch)
             # overlap qk norm
             if fused_norm is not None:
-                q, latent_cache = fused_norm
+                q, latent_cache, k31_q_b = fused_norm
                 k_nope = latent_cache[..., : self.kv_lora_rank]
                 k31_cache_saved = True
             elif self.alt_stream is not None and get_is_capture_mode():
@@ -732,6 +733,7 @@ class DeepseekMLARocmForwardMixin:
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
                 and not q_replicate_active
+                and k31_q_b is None
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -761,6 +763,8 @@ class DeepseekMLARocmForwardMixin:
                         self.num_local_heads * self.dcp_size,
                         self.qk_head_dim,
                     )
+                elif k31_q_b is not None:
+                    q = k31_q_b.view(-1, self.num_local_heads, self.qk_head_dim)
                 else:
                     q = self.q_b_proj_forward(q)
 

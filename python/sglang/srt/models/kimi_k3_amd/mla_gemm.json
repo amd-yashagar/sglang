@@ -45,33 +45,23 @@
     }
   },
   "5:7168:1536": {
-    "kind": "flydsl",
+    "kind": "skinny",
     "config": {
-      "block_m": 16,
-      "block_n": 32,
-      "block_k": 64,
-      "stages": 8,
-      "split_k": 1,
-      "m_waves": 1,
-      "n_waves": 2,
-      "k_waves": 1,
-      "group_m": 0,
-      "use_half_tile_interleaved": false
+      "block_m": 8,
+      "block_n": 16,
+      "block_k": 128,
+      "stages": 3,
+      "k_waves": 4
     }
   },
   "5:3648:7168": {
-    "kind": "flydsl",
+    "kind": "skinny",
     "config": {
-      "block_m": 16,
-      "block_n": 64,
+      "block_m": 8,
+      "block_n": 16,
       "block_k": 128,
       "stages": 3,
-      "split_k": 7,
-      "m_waves": 1,
-      "n_waves": 2,
-      "k_waves": 1,
-      "group_m": 0,
-      "use_half_tile_interleaved": false
+      "k_waves": 4
     }
   },
   "40:2112:7168": {
@@ -120,18 +110,13 @@
     }
   },
   "40:7168:1536": {
-    "kind": "flydsl",
+    "kind": "skinny",
     "config": {
-      "block_m": 48,
+      "block_m": 40,
       "block_n": 32,
       "block_k": 128,
-      "stages": 4,
-      "split_k": 1,
-      "m_waves": 1,
-      "n_waves": 2,
-      "k_waves": 2,
-      "group_m": 0,
-      "use_half_tile_interleaved": false
+      "stages": 2,
+      "k_waves": 4
     }
   },
   "40:3648:7168": {
@@ -173,7 +158,7 @@
     "config": null
   },
   "320:7168:1536": {
-    "kind": "hipblaslt",
+    "kind": "asm_preshuffle",
     "config": null
   },
   "320:3648:7168": {

@@ -91,7 +91,7 @@ def norm_cache(q, kv, qw, kw, cache, loc, qeps=1e-5, keps=1e-5):
 
 
 def try_norm_cache(attn, q, latent, batch):
-    """Conservative serving guard; None preserves every unsupported writer."""
+    """Return Q, KV and optional precomputed q_b; None preserves unsupported writers."""
     if not getattr(attn, "_k31_mla_fuse", False):
         return None
     if not (
@@ -159,7 +159,44 @@ def try_norm_cache(attn, q, latent, batch):
         and cache.dtype == torch.bfloat16
     ):
         return None
-    return norm_cache(
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.kimi_k3_amd.mla_norm_qb import covered, norm_qb_cache
+    from sglang.srt.runtime_context import get_lora
+
+    if (
+        getattr(attn, "_mla_a_gate_weight", None) is not None
+        # Preserve the existing q_b/indexer overlap during ordinary DSA decode.
+        # Verify does not take that side-stream path.
+        and not (
+            getattr(attn, "use_dsa", False)
+            and getattr(attn, "alt_stream", None) is not None
+            and batch.forward_mode.is_decode_or_idle()
+        )
+        and isinstance(attn.q_b_proj.quant_method, UnquantizedLinearMethod)
+        and not get_lora().enable_lora
+        and not get_lora().lora_paths
+        and attn.q_a_layernorm.variance_epsilon == 1e-5
+        and attn.kv_a_layernorm.variance_epsilon == 1e-5
+        and covered(
+            q,
+            latent,
+            attn.q_a_layernorm.weight,
+            attn.kv_a_layernorm.weight,
+            attn.q_b_proj.weight,
+            cache,
+            batch.out_cache_loc,
+        )
+    ):
+        return norm_qb_cache(
+            q,
+            latent,
+            attn.q_a_layernorm.weight,
+            attn.kv_a_layernorm.weight,
+            attn.q_b_proj.weight,
+            cache,
+            batch.out_cache_loc,
+        )
+    qo, ko = norm_cache(
         q,
         latent,
         attn.q_a_layernorm.weight,
@@ -169,3 +206,4 @@ def try_norm_cache(attn, q, latent, batch):
         attn.q_a_layernorm.variance_epsilon,
         attn.kv_a_layernorm.variance_epsilon,
     )
+    return qo, ko, None

@@ -2864,6 +2864,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         self._use_min_latency_q_b_gemm = False
         for linear in (a, self.q_b_proj, self.g_proj, self.o_proj):
             linear.k31_mla_fuse = True
+        if isinstance(self.o_proj.quant_method, UnquantizedLinearMethod):
+            from sglang.srt.models.kimi_k3_amd.mla_gemm import prepare_o_proj_weight
+
+            prepare_o_proj_weight(self.o_proj.weight)
 
     def prepare_qkv_latent(self, hidden_states, forward_batch):
         from sglang.srt.layers.layer_boundary import get_attn_tp_context

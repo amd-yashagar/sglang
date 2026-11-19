@@ -69,6 +69,33 @@ def _flydsl_no_split(x, weight, out, config):
     )
 
 
+def prepare_o_proj_weight(weight):
+    """One-time/reload preshuffle; retain dense fallback and graph-stable storage.
+
+    This is deliberately called at post-load, never lazily during a forward.
+    Keeping the original parameter also preserves checkpoint/loaders and M not
+    covered by the measured dispatch. Costs 22 MB per TP8 MLA layer.
+    """
+    if (
+        weight.shape != (7168, 1536)
+        or weight.dtype != torch.bfloat16
+        or not weight.is_contiguous()
+    ):
+        return
+    from aiter.ops.shuffle import shuffle_weight
+
+    packed = shuffle_weight(weight, layout=(16, 16))
+    previous = getattr(weight, "_k31_preshuffled", None)
+    if (
+        previous is not None
+        and previous.shape == packed.shape
+        and previous.device == packed.device
+    ):
+        previous.copy_(packed)
+    else:
+        weight._k31_preshuffled = packed
+
+
 def mla_linear_into(x, weight, out):
     if not (
         mla_gemm_covered(x, weight)
@@ -81,6 +108,27 @@ def mla_linear_into(x, weight, out):
     cfg = _paths()[f"{x.shape[0]}:{weight.shape[0]}:{weight.shape[1]}"]
     if cfg["kind"] == "hipblaslt":
         torch.mm(x, weight.t(), out=out)
+    elif cfg["kind"] == "skinny":
+        from aiter.ops.flydsl.kernels.gemm_a16w16_skinny_gfx950 import (
+            gemm_a16w16_skinny,
+        )
+
+        gemm_a16w16_skinny(x, weight, out=out, **cfg["config"])
+    elif cfg["kind"] == "asm_preshuffle":
+        packed = getattr(weight, "_k31_preshuffled", None)
+        if packed is None:
+            torch.mm(x, weight.t(), out=out)
+        else:
+            from aiter.ops.gemm_op_a16w16 import gemm_a16w16_asm
+
+            gemm_a16w16_asm(
+                x,
+                packed,
+                out,
+                splitK=1,
+                kernelName="_ZN5aiter43bf16gemm_fp32bf16_tn_160x64_bshuffle_splitkE",
+                bpreshuffle=True,
+            )
     elif cfg["config"]["split_k"] == 1:
         _flydsl_no_split(x, weight, out, cfg["config"])
     else:

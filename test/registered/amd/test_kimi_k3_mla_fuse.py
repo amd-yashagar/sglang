@@ -198,6 +198,241 @@ class TestK31MLAFuse(unittest.TestCase):
             self.assertEqual(owner._mla_a_gate_weight.data_ptr(), ptr)
             self.assertTrue(torch.all(owner._mla_a_gate_weight[2112:] == 0.25))
 
+    def test_norm_qb_changed_input_graph(self):
+        from sglang.srt.models.kimi_k3_amd.mla_norm_qb import covered, norm_qb_cache
+
+        a = torch.randn(5, 3648, device="cuda", dtype=torch.bfloat16)
+        qw = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+        kw = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(2304, 1536, device="cuda", dtype=torch.bfloat16) / 1536**0.5
+        loc = torch.tensor([1, 2, 0, -1, 4096], device="cuda", dtype=torch.int64)
+        cache = torch.full((4096, 1, 576), 7, device="cuda", dtype=torch.bfloat16)
+
+        def run():
+            return norm_qb_cache(a[:, :1536], a[:, 1536:2112], qw, kw, w, cache, loc)
+
+        self.assertFalse(
+            covered(a[:, :1536].contiguous(), a[:, 1536:2112], qw, kw, w, cache, loc)
+        )
+        self.assertTrue(
+            covered(a[:, :1536], a[:, 1536:2112], qw, kw, w, cache, loc.int())
+        )
+        for dtype in (torch.int64, torch.int32):
+            loc = loc.to(dtype)
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                q, k, qb = run()
+            for _ in range(3):
+                a.normal_()
+                qw.normal_()
+                kw.normal_()
+                w.normal_(std=1536**-0.5)
+                graph.replay()
+                torch.cuda.synchronize()
+                rq = rms(a[:, :1536], qw, 1e-5)
+                rk = torch.cat((rms(a[:, 1536:2048], kw, 1e-5), a[:, 2048:2112]), -1)
+                torch.testing.assert_close(q, rq, rtol=0.008, atol=0.008)
+                torch.testing.assert_close(k, rk, rtol=0.008, atol=0.008)
+                torch.testing.assert_close(
+                    qb, torch.nn.functional.linear(rq, w), rtol=0.03, atol=0.03
+                )
+                torch.testing.assert_close(cache[loc[:2], 0], k[:2], rtol=0, atol=0)
+                self.assertTrue(torch.all(cache[0] == 7))
+                self.assertTrue(torch.all(cache[3:] == 7))
+
+    def test_preshuffled_o_proj_reload(self):
+        from sglang.srt.models.kimi_k3_amd.mla_gemm import prepare_o_proj_weight
+
+        x = torch.randn(320, 1536, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(7168, 1536, device="cuda", dtype=torch.bfloat16) / 1536**0.5
+        prepare_o_proj_weight(w)
+        ptr = w._k31_preshuffled.data_ptr()
+        mla_linear(x, w)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y = mla_linear(x, w)
+        for _ in range(3):
+            x.normal_()
+            w.normal_(std=1536**-0.5)
+            prepare_o_proj_weight(w)
+            self.assertEqual(ptr, w._k31_preshuffled.data_ptr())
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                y, torch.nn.functional.linear(x, w), rtol=0.02, atol=0.03
+            )
+
+    def test_rocm_prepare_core_hooks(self):
+        # Real serving prepare/core, with only attention (owned by another lane)
+        # and the pool/context providers replaced. All arithmetic is real GPU code.
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.mem_cache.kv.layout.mla import MLAView
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+            DeepseekMLARocmForwardMixin,
+        )
+        from sglang.srt.models.kimi_k3 import KimiK3MLAAttention
+
+        a = torch.randn(5, 3648, device="cuda", dtype=torch.bfloat16)
+        hidden = torch.randn(5, 7168, device="cuda", dtype=torch.bfloat16)
+        qw = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+        kw = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+        wb = torch.randn(2304, 1536, device="cuda", dtype=torch.bfloat16) / 1536**0.5
+        wo = torch.randn(7168, 1536, device="cuda", dtype=torch.bfloat16) / 1536**0.5
+        wk = (
+            torch.randn(12, 512, 128, device="cuda", dtype=torch.bfloat16) / 128**0.5
+        ).transpose(1, 2)
+        wv = (
+            torch.randn(12, 128, 512, device="cuda", dtype=torch.bfloat16) / 512**0.5
+        ).transpose(1, 2)
+        v = torch.randn(5, 12, 512, device="cuda", dtype=torch.bfloat16)
+        loc = torch.arange(1, 6, device="cuda", dtype=torch.int64)
+        cache = torch.full((4096, 1, 576), 7, device="cuda", dtype=torch.bfloat16)
+        pool = object.__new__(MLAView)
+        pool.dtype = torch.bfloat16
+        handle = SimpleNamespace(view=pool, plain=False, owner=True, key=lambda: cache)
+
+        class Output:
+            weight = wo
+
+            def __call__(self, z):
+                return mla_linear(z, self.weight), None
+
+        def attention(q, *args, **kwargs):
+            self.assertFalse(kwargs["save_kv_cache"])
+            owner.last_query = q
+            return v
+
+        attention.layer_id = 0
+
+        def duplicate_qb(_):
+            raise AssertionError("q_b was launched twice")
+
+        owner = SimpleNamespace(
+            _k31_mla_fuse=True,
+            _mla_a_gate_weight=torch.empty(1),
+            dcp_size=1,
+            current_attention_backend="dsa",
+            rotary_emb=None,
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            num_local_heads=12,
+            qk_head_dim=192,
+            q_a_layernorm=SimpleNamespace(weight=qw, variance_epsilon=1e-5),
+            kv_a_layernorm=SimpleNamespace(weight=kw, variance_epsilon=1e-5),
+            q_b_proj=SimpleNamespace(weight=wb, quant_method=UnquantizedLinearMethod()),
+            q_b_proj_forward=duplicate_qb,
+            attn_mqa=attention,
+            o_proj=Output(),
+            use_deep_gemm_bmm=False,
+            use_dsa=False,
+            alt_stream=None,
+            w_kc=wk,
+            w_vc=wv,
+            w_scale=1.0,
+            v_head_dim=128,
+            next_skip_topk=None,
+            _gate_pending_stream=None,
+            is_dcp_q_replicate_phase=lambda _: False,
+            is_dcp_mla_decode_phase=lambda _: False,
+            _applies_rope_in_prepare=lambda _: False,
+            _split_q_nope_pe=lambda q, k: (
+                q[:, :, :128],
+                q[:, :, 128:],
+                k[:, 512:].view(5, 1, 64),
+            ),
+        )
+        owner._compute_output_gate = lambda x: KimiK3MLAAttention._compute_output_gate(
+            owner, x
+        )
+        positions = torch.arange(5, device="cuda", dtype=torch.int64)
+        for decode in (True, False):
+            mode = SimpleNamespace(
+                is_decode_or_idle=lambda: decode,
+                is_target_verify=lambda: not decode,
+                is_extend_or_draft_extend_or_mixed=lambda: False,
+            )
+            batch = SimpleNamespace(
+                forward_mode=mode, out_cache_loc=loc, out_cache_loc_is_physical=True
+            )
+
+            def run():
+                owner._gate_hidden_states = hidden
+                owner._mla_gate_precomputed = a[:, 2112:]
+                prepared = DeepseekMLARocmForwardMixin.forward_absorb_rocm_prepare(
+                    owner, positions, hidden, batch, None
+                )
+                self.assertTrue(prepared[-3])
+                return DeepseekMLARocmForwardMixin.forward_absorb_rocm_core(
+                    owner, *prepared
+                )
+
+            prefix = "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm"
+            with (
+                patch(
+                    prefix + ".get_attn_tp_context",
+                    return_value=SimpleNamespace(fetch_qkv_latent=lambda: a[:, :2112]),
+                ),
+                patch(
+                    "sglang.srt.model_executor.forward_context.get_kv_layers",
+                    return_value=SimpleNamespace(layer=lambda _: handle),
+                ),
+                patch(
+                    "sglang.srt.runtime_context.get_lora",
+                    return_value=SimpleNamespace(enable_lora=False, lora_paths=None),
+                ),
+            ):
+                if decode:
+                    from sglang.srt.models.kimi_k3_amd.mla_fuse import try_norm_cache
+
+                    owner.use_dsa = True
+                    owner.alt_stream = torch.cuda.Stream()
+                    fallback = try_norm_cache(
+                        owner, a[:, :1536], a[:, 1536:2112], batch
+                    )
+                    self.assertIsNone(fallback[2])
+                    owner.use_dsa = False
+                    owner.alt_stream = None
+                run()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    got = run()
+                for _ in range(2):
+                    a.normal_()
+                    v.normal_()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    qr = rms(a[:, :1536], qw, 1e-5)
+                    qb = torch.nn.functional.linear(qr, wb).view(5, 12, 192)
+                    qref = torch.cat(
+                        (
+                            torch.bmm(qb[:, :, :128].transpose(0, 1), wk).transpose(
+                                0, 1
+                            ),
+                            qb[:, :, 128:],
+                        ),
+                        -1,
+                    )
+                    vals = (
+                        torch.bmm(v.transpose(0, 1), wv)
+                        .transpose(0, 1)
+                        .contiguous()
+                        .flatten(1)
+                    )
+                    ref = torch.nn.functional.linear(
+                        vals * torch.sigmoid(a[:, 2112:]), wo
+                    )
+                    torch.testing.assert_close(
+                        owner.last_query, qref, rtol=0.03, atol=0.03
+                    )
+                    torch.testing.assert_close(got, ref, rtol=0.03, atol=0.03)
+                    self.assertIsNone(owner._gate_hidden_states)
+                    self.assertIsNone(owner._mla_gate_precomputed)
+
     def test_q_absorb_cat(self):
         torch.manual_seed(9)
         for m in (0, 1, 5, 40, 320):
