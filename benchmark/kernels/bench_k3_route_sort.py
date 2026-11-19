@@ -196,11 +196,6 @@ def kernels(fn):
 
 def compile_v2_offline():
     """Build exact candidate specializations without any device queries."""
-    from sglang.kernels.ops.moe.k3_route_sort_blocks import (
-        _expert_prefix,
-        _route_quant_membership,
-        _scatter_blocks,
-    )
     from triton.backends.compiler import GPUTarget
     from triton.runtime import driver
     from triton.runtime.jit import MockTensor
@@ -212,6 +207,12 @@ def compile_v2_offline():
         raise RuntimeError(
             "Offline compilation requires all three visibility variables empty"
         )
+
+    from sglang.kernels.ops.moe.k3_route_sort_blocks import (
+        _expert_prefix,
+        _route_quant_membership,
+        _scatter_blocks,
+    )
 
     class OfflineDriver:
         def get_current_device(self):
