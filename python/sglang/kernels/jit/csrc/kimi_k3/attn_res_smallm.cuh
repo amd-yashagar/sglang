@@ -123,7 +123,7 @@ __device__ __forceinline__ uint8_t to_e4m3(float x) {
 
 }  // namespace attn_res_smallm
 
-template <int kNVB, int kVPT, int kThreads>
+template <int kNVB, int kVPT, int kThreads, bool kNativeMath>
 __global__ void __launch_bounds__(kThreads) attn_res_smallm_kernel(const AttnResSmallMParams __grid_constant__ p) {
   using namespace device;
   using namespace attn_res_smallm;
@@ -213,7 +213,9 @@ __global__ void __launch_bounds__(kThreads) attn_res_smallm_kernel(const AttnRes
   float score[kR];
 #pragma unroll
   for (int r = 0; r < kR; ++r)
-    score[r] = part[2 * r] / sqrtf(part[2 * r + 1] * inv_h + p.score_eps);
+    score[r] = kNativeMath
+                   ? part[2 * r] * __builtin_amdgcn_rsqf(part[2 * r + 1] * inv_h + p.score_eps)
+                   : part[2 * r] / sqrtf(part[2 * r + 1] * inv_h + p.score_eps);
   float m = score[kNVB];
 #pragma unroll
   for (int r = 0; r < kNVB; ++r)
@@ -222,11 +224,12 @@ __global__ void __launch_bounds__(kThreads) attn_res_smallm_kernel(const AttnRes
   float den = 0.f;
 #pragma unroll
   for (int r = 0; r < kNVB; ++r) {
-    w[r] = expf(score[r] - m);
+    w[r] = kNativeMath ? __builtin_amdgcn_exp2f((score[r] - m) * 1.4426950408889634f) : expf(score[r] - m);
     den += w[r];
   }
-  w[kNVB] = expf(score[kNVB] - m);
-  const float inv = 1.0f / (den + w[kNVB]);
+  w[kNVB] = kNativeMath ? __builtin_amdgcn_exp2f((score[kNVB] - m) * 1.4426950408889634f)
+                       : expf(score[kNVB] - m);
+  const float inv = kNativeMath ? __builtin_amdgcn_rcpf(den + w[kNVB]) : 1.0f / (den + w[kNVB]);
 #pragma unroll
   for (int r = 0; r < kR; ++r)
     w[r] *= inv;
@@ -272,7 +275,7 @@ __global__ void __launch_bounds__(kThreads) attn_res_smallm_kernel(const AttnRes
   const bool norm = p.ow != nullptr;
   if (norm) {
     const float asq = block_sum1<kThreads>(asq2.x + asq2.y, smem_b);
-    scale = 1.0f / sqrtf(asq * inv_h + p.out_eps);
+    scale = kNativeMath ? __builtin_amdgcn_rsqf(asq * inv_h + p.out_eps) : 1.0f / sqrtf(asq * inv_h + p.out_eps);
   }
 #pragma unroll
   for (int j = 0; j < kVPT; ++j) {
@@ -309,11 +312,14 @@ __global__ void __launch_bounds__(kThreads) attn_res_smallm_kernel(const AttnRes
   }
 }
 
-template <int kVPT, int kThreads>
+// The native-math specialization is opt-in. Unlike a Gram-form output norm,
+// it still sums the actual mixed vector squared, preserving cancellation.
+// It removes IEEE div/sqrt/exp fixup chains, not the bf16 rounding points.
+template <int kVPT, int kThreads, bool kNativeMath = false>
 struct AttnResSmallMKernel {
   template <int kNVB>
   static void launch(const AttnResSmallMParams& params, int64_t T, DLDevice dev) {
-    host::LaunchKernel(static_cast<uint32_t>(T), kThreads, dev)(attn_res_smallm_kernel<kNVB, kVPT, kThreads>, params);
+    host::LaunchKernel(static_cast<uint32_t>(T), kThreads, dev)(attn_res_smallm_kernel<kNVB, kVPT, kThreads, kNativeMath>, params);
   }
 
   // Optional operands are passed as real tensors plus a has_* flag (the

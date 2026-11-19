@@ -29,10 +29,10 @@ def _launch_shape(hidden_size: int) -> tuple[int, int]:
 
 
 @cache_once
-def _module(vpt: int, threads: int) -> Module:
-    args = make_cpp_args(vpt, threads)
+def _module(vpt: int, threads: int, native_math: bool = False) -> Module:
+    args = make_cpp_args(vpt, threads, native_math)
     return load_jit(
-        f"kimi_k3_attn_res_smallm_{vpt}_{threads}",
+        f"kimi_k3_attn_res_smallm_{vpt}_{threads}_{native_math}",
         *args,
         cuda_files=["kimi_k3/attn_res_smallm.cuh"],
         cuda_wrappers=[("run", f"AttnResSmallMKernel<{args}>::run")],
@@ -63,13 +63,36 @@ def attn_res_smallm_hip(
     write_prefix: bool = False,
     out_fp8: Optional[torch.Tensor] = None,
     stream_out: Optional[torch.Tensor] = None,
+    native_math: bool = False,
 ) -> None:
     """attn_res_hip; stream_out (optional [T, H], row-strided ok) also receives
-    the bf16 pre-norm mixture (a dspark aux capture)."""
+    the bf16 pre-norm mixture (a dspark aux capture). native_math selects
+    the gfx950-validated hardware rsq/exp2/rcp specialization; the mixture is
+    accumulated and normalized directly (no Gram cancellation)."""
     T, H = prefix_sum.shape
     assert supported(H, nvb), (H, nvb)
     assert addend is None or prefix_out is not None, "addend requires prefix_out"
     assert cw.dtype == torch.float32 and prefix_sum.dtype == torch.bfloat16
+    # At verify M=320, a pending add lowers the all-rows register kernel
+    # occupancy enough that the PR streaming kernel wins. Keep that path;
+    # a simultaneous stream output still needs the HIP kernel.
+    if native_math and T >= 256 and addend is not None and stream_out is None:
+        from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
+
+        return attn_res_hip(
+            prefix_sum,
+            bank,
+            cw,
+            ow,
+            out,
+            nvb,
+            score_eps,
+            out_eps,
+            addend=addend,
+            prefix_out=prefix_out,
+            write_prefix=write_prefix,
+            out_fp8=out_fp8,
+        )
     vpt, threads = _launch_shape(H)
     flags = (
         (1 if addend is not None else 0)
@@ -79,7 +102,7 @@ def attn_res_smallm_hip(
         | (16 if stream_out is not None else 0)
     )
     # Unused operands still need a real tensor; the flags gate every access.
-    _module(vpt, threads).run(
+    _module(vpt, threads, native_math).run(
         prefix_sum,
         addend if addend is not None else prefix_sum,
         prefix_out if addend is not None else prefix_sum,

@@ -2,12 +2,14 @@
 
 import pytest
 import torch
-
 from sglang.kernels.ops.attention import attn_res_smallm_hip as smallm
 from sglang.srt.layers import attn_residual
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+_real_smallm_max_t = attn_residual.smallm_max_t.__wrapped__
 
 
 @pytest.fixture(autouse=True)
@@ -42,3 +44,13 @@ def test_gate_matches_kernel_contract():
             assert attn_residual.use_hip_smallm(
                 4, hidden, nvb, torch.bfloat16
             ) == smallm.supported(hidden, nvb)
+
+
+def test_native_math_coverage_is_opt_in(monkeypatch):
+    monkeypatch.setattr(attn_residual, "is_hip", lambda: True)
+    monkeypatch.delenv("SGLANG_K3_ATTN_RES_NATIVE", raising=False)
+    assert _real_smallm_max_t() == 128
+    monkeypatch.setenv("SGLANG_K3_ATTN_RES_NATIVE", "1")
+    assert _real_smallm_max_t() == 320
+    monkeypatch.setattr(attn_residual, "is_hip", lambda: False)
+    assert _real_smallm_max_t() == 0

@@ -1,13 +1,12 @@
 import functools
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 # SPDX-License-Identifier: Apache-2.0
@@ -81,10 +80,17 @@ def _same_storage_view(a: torch.Tensor, b: torch.Tensor) -> bool:
     )
 
 
+def _native_attn_res_enabled() -> bool:
+    # Opt-in until model-level validation; the TP fused kernels are unchanged.
+    return os.environ.get("SGLANG_K3_ATTN_RES_NATIVE", "0") == "1"
+
+
 @functools.cache
 def smallm_max_t() -> int:
     """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
-    return 128 if is_hip() else 0
+    if not is_hip():
+        return 0
+    return 320 if _native_attn_res_enabled() else 128
 
 
 @functools.cache
@@ -129,6 +135,8 @@ def get_cw(
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
     if cw is None or refresh:
+        from sglang.srt.models.utils import bind_or_assign
+
         # Refresh in place: captured graphs retain the original cache storage.
         updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
         cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
@@ -378,6 +386,7 @@ def _aggregate_hip(
 
         kernel = attn_res_smallm_hip
         extra["stream_out"] = stream_out
+        extra["native_math"] = _native_attn_res_enabled()
     else:
         assert stream_out is None, "stream_out needs the small-M kernel"
     kernel(
