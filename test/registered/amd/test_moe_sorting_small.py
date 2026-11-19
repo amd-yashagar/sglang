@@ -371,11 +371,17 @@ class TestK3PackedRouteSort(CustomTestCase):
         env.start()
         self.addCleanup(env.stop)
 
+    def _api(self):
+        from sglang.kernels.ops.moe.k3_route_sort_fast import route_sort_quant
+
+        return route_sort_quant
+
     def _check(self, m, n, pattern, graph=False, dtype=torch.bfloat16):
         import aiter
         import aiter.fused_moe as fm
-        from sglang.kernels.ops.moe.k3_route_sort_fast import route_sort_quant
         from sglang.kernels.ops.moe.k3_route_sort_mid import counts_buffer
+
+        route_sort_quant = self._api()
 
         torch.manual_seed(10000 + m)
         logits = torch.randn(m, 992, device="cuda", dtype=dtype)[:, 32:928]
@@ -416,7 +422,12 @@ class TestK3PackedRouteSort(CustomTestCase):
             with torch.cuda.graph(g):
                 q, scale = run()
             for _ in range(5):
+                # Replay with changed inputs, not merely the capture inputs.
+                if pattern != "underflow":
+                    logits.neg_()
+                x.neg_()
                 g.replay()
+            aiter.biased_grouped_topk(logits, bias, rw, ri, 1, 1, True)
         msg = f"m={m} n={n} {pattern}"
         self.assertTrue(torch.equal(ids, ri), msg + " expert ids")
         self.assertTrue(torch.equal(w, rw), msg + " routing weights")
@@ -427,9 +438,10 @@ class TestK3PackedRouteSort(CustomTestCase):
         self.assertEqual(out[1][:valid].tolist(), refs[1], msg + " sorted weights")
         self.assertEqual(out[2][: valid // 32].tolist(), refs[2], msg + " experts")
         self.assertTrue(bool((out[4] == 0).all()), msg + " zero moe_buf")
+        from sglang.kernels.ops.moe.k3_route_sort_blocks import _BITMAPS as v2_bitmaps
         from sglang.kernels.ops.moe.k3_route_sort_fast import _BITMAPS
 
-        for bitmap in _BITMAPS.values():
+        for bitmap in (*_BITMAPS.values(), *v2_bitmaps.values()):
             self.assertTrue(bool((bitmap == 0).all()), msg + " bitmap reset")
         self.assertTrue(
             bool((counts_buffer(x.device, "fast", 896) == 0).all()), msg + " reset"
@@ -476,7 +488,7 @@ class TestK3PackedRouteSort(CustomTestCase):
                         self._check(m, n, pattern, graph=True)
 
     def test_opt_in_required(self):
-        from sglang.kernels.ops.moe.k3_route_sort_fast import route_sort_quant
+        route_sort_quant = self._api()
 
         with (
             patch.dict(os.environ, {"SGLANG_K3_ROUTE_SORT_FAST": "0"}),
@@ -485,15 +497,31 @@ class TestK3PackedRouteSort(CustomTestCase):
             route_sort_quant(None, None, None, None, None, None)
 
     def test_fp32_router(self):
-        for m in (1, 5, 8, 40, 64, 320):
-            for pattern in ("random", "ties", "skew", "one_rank", "underflow"):
-                with self.subTest(m=m, pattern=pattern):
-                    self._check(m, 3584, pattern, graph=True, dtype=torch.float32)
+        for n in (3584, 7168):
+            for m in (1, 5, 8, 40, 64, 320):
+                for pattern in ("random", "ties", "skew", "one_rank", "underflow"):
+                    with self.subTest(m=m, n=n, pattern=pattern):
+                        self._check(m, n, pattern, graph=True, dtype=torch.float32)
 
     def test_every_m(self):
         for m in range(1, 321):
             with self.subTest(m=m):
                 self._check(m, 3584, "random")
+
+
+class TestK3BlockRouteSort(TestK3PackedRouteSort):
+    """V2 uses the same complete aiter/stable-sort/quant oracle matrix."""
+
+    def test_every_m_concentrated(self):
+        for m in range(1, 321):
+            for pattern in ("ties", "one_rank"):
+                with self.subTest(m=m, pattern=pattern):
+                    self._check(m, 3584, pattern)
+
+    def _api(self):
+        from sglang.kernels.ops.moe.k3_route_sort_blocks import route_sort_quant
+
+        return route_sort_quant
 
 
 if __name__ == "__main__":

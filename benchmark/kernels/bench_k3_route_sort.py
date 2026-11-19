@@ -4,6 +4,7 @@ PR routing uses the exact extracted top-k body; shared-GEMM overlap is NOT credi
 """
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -135,7 +136,17 @@ def paths(logits, bias, x):
             q = route_sort_quant(logits, bias, x, ids, w, out, BS)
             return ids, w, out, q
 
-        result["candidate"] = candidate
+        result["v1"] = candidate
+        from sglang.kernels.ops.moe.k3_route_sort_blocks import (
+            route_sort_quant as blocks,
+        )
+
+        def candidate_v2():
+            os.environ["SGLANG_K3_ROUTE_SORT_FAST"] = "1"
+            q = blocks(logits, bias, x, ids, w, out, BS)
+            return ids, w, out, q
+
+        result["candidate"] = candidate_v2
     except ImportError:
         pass
     return result
@@ -183,6 +194,91 @@ def kernels(fn):
     ]
 
 
+def compile_v2_offline():
+    """Build exact candidate specializations without any device queries."""
+    from sglang.kernels.ops.moe.k3_route_sort_blocks import (
+        _expert_prefix,
+        _route_quant_membership,
+        _scatter_blocks,
+    )
+    from triton.backends.compiler import GPUTarget
+    from triton.runtime import driver
+    from triton.runtime.jit import MockTensor
+
+    if any(
+        os.environ.get(k) != ""
+        for k in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+    ):
+        raise RuntimeError(
+            "Offline compilation requires all three visibility variables empty"
+        )
+
+    class OfflineDriver:
+        def get_current_device(self):
+            return 0
+
+        def get_current_stream(self, device):
+            return 0
+
+        def get_current_target(self):
+            return GPUTarget("hip", "gfx950", 64)
+
+    driver.set_active(OfflineDriver())
+    i, f, b, q, u = (
+        MockTensor(dt)
+        for dt in (
+            torch.int32,
+            torch.float32,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.uint8,
+        )
+    )
+    for m in (129, 257):
+        mp = triton.next_power_of_2(triton.cdiv(m, 32))
+        _expert_prefix.warmup(i, i, i, i, i, m, MP=mp, num_warps=4, grid=(1,))
+        for n in (3584, 7168):
+            for lg in (b, f):
+                _route_quant_membership.warmup(
+                    lg,
+                    lg,
+                    b,
+                    i,
+                    f,
+                    i,
+                    u,
+                    q,
+                    u,
+                    b,
+                    m,
+                    896,
+                    n,
+                    N=n,
+                    MP=mp,
+                    num_warps=4,
+                    grid=(1,),
+                )
+            _scatter_blocks.warmup(
+                f,
+                u,
+                u,
+                i,
+                i,
+                i,
+                f,
+                i,
+                i,
+                u,
+                m,
+                G=n // 32,
+                GP=triton.next_power_of_2(n // 64),
+                MP=mp,
+                num_warps=4,
+                grid=(1,),
+            )
+            print(f"Compiled V2 gfx950 N={n} bitmap_words={mp}", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ms", type=int, nargs="+", default=MS)
@@ -191,9 +287,22 @@ def main():
         "--patterns", nargs="+", default=["correlated", "skew", "one_rank", "ties"]
     )
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument(
+        "--paths",
+        nargs="+",
+        choices=("main", "pr46656", "v1", "candidate"),
+        default=["main", "pr46656", "v1", "candidate"],
+    )
     p.add_argument("--logits-dtype", choices=("bf16", "fp32"), default="bf16")
-    p.add_argument("--output", required=True, type=Path)
+    p.add_argument("--compile-only", action="store_true")
+    p.add_argument("--output", type=Path)
     a = p.parse_args()
+    if a.compile_only:
+        compile_v2_offline()
+        return
+    if a.output is None:
+        p.error("--output is required for measurement")
     print("device", torch.cuda.get_device_properties(0), flush=True)
     print(
         "Isolated routing glue; shared GEMM overlap excluded. Roof 250/92 = 2.717 us/layer.",
@@ -212,6 +321,8 @@ def main():
                     )
                 )
                 for name, fn in fs.items():
+                    if name not in a.paths:
+                        continue
                     med, lo, hi = graph_us(fn)
                     row = {
                         "m": m,
@@ -228,10 +339,13 @@ def main():
                     if a.profile:
                         row["kernels"] = kernels(fn)
                     rows.append(row)
-                    print(
-                        json.dumps({k: v for k, v in row.items() if k != "kernels"}),
-                        flush=True,
-                    )
+                    if not a.quiet:
+                        print(
+                            json.dumps(
+                                {k: v for k, v in row.items() if k != "kernels"}
+                            ),
+                            flush=True,
+                        )
     a.output.write_text(
         json.dumps(
             {
@@ -258,6 +372,12 @@ def main():
                     ],
                     text=True,
                 ).strip(),
+                "candidate_source_sha256": hashlib.sha256(
+                    (
+                        Path(small.__file__).parent / "k3_route_sort_blocks.py"
+                    ).read_bytes()
+                ).hexdigest(),
+                "candidate_strategy": "V1 fallback; otherwise route/quant, bitmap-prefix/reset, block scatter (three launches)",
                 "main_baseline": "ba9c86bb7e",
                 "pr_baseline": "0761dfa0f9",
                 "trials": 7,
