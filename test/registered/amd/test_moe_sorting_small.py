@@ -8,6 +8,7 @@ from unittest import TestCase as CustomTestCase
 from unittest.mock import patch
 
 import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=80, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -29,6 +30,7 @@ class TestMoeSortingSmall(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         import aiter.fused_moe as fm
+
         from sglang.kernels.ops.moe import moe_sorting_small as S
 
         cls.S = S
@@ -206,6 +208,7 @@ class TestMoeSortQuant(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         import aiter.fused_moe as fm
+
         from sglang.kernels.ops.moe import moe_sorting_small as S
 
         if not S.apply_aiter_small_moe_sort_patch():
@@ -379,6 +382,7 @@ class TestK3PackedRouteSort(CustomTestCase):
     def _check(self, m, n, pattern, graph=False, dtype=torch.bfloat16):
         import aiter
         import aiter.fused_moe as fm
+
         from sglang.kernels.ops.moe.k3_route_sort_mid import counts_buffer
 
         route_sort_quant = self._api()
