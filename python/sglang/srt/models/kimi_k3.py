@@ -2588,13 +2588,19 @@ class KimiK3DeltaAttention(nn.Module):
         # into the recurrence kernel. If the backend leaves the stash
         # unconsumed (env off or shape not covered), apply o_norm here as
         # before.
-        fused_onorm = (self._kda_fused_decode_ready or defer_f_b) and (
+        verify_onorm = (
+            envs.SGLANG_OPT_KDA_VERIFY_GFX950.get()
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        fused_onorm = (self._kda_fused_decode_ready or defer_f_b or verify_onorm) and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
+            self.attn._k3_verify_norm_weight = self.o_norm.weight.detach()
+            self.attn._k3_verify_norm_eps = self.o_norm.eps
         if defer_f_b:
             self.attn._k3_deferred_f_b = True
 
@@ -2607,6 +2613,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         if fused_onorm:
             self.attn._k3_onorm_gate = None
+            self.attn._k3_verify_norm_weight = None
             fused_onorm = self.attn._k3_onorm_consumed
         if defer_f_b:
             self.attn._k3_deferred_f_b = False

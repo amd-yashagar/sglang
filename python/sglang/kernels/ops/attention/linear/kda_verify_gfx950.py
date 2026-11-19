@@ -11,14 +11,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
 @cache_once
-def _jit_module(bv: int, t: int, lower_bound: bool, snap: bool) -> Module:
-    args = make_cpp_args(bv, t, lower_bound, snap)
+def _jit_module(
+    bv: int, t: int, lower_bound: bool, snap: bool, optimized: bool = False
+) -> Module:
+    args = make_cpp_args(bv, t, lower_bound, snap, optimized)
     return load_jit(
         "kda_verify_gfx950",
         *args,
@@ -89,6 +92,20 @@ def supports_kda_verify_gfx950(
     )
 
 
+def use_full_head_verify(
+    *, batch_size: int, T: int, heads: int, snap: bool, with_norm: bool
+) -> bool:
+    # Cold-state, 69-layer graphs: a full head underfills gfx950 at c1; at c8
+    # it only wins when it also consumes the norm. Preserve those fallbacks.
+    return (
+        envs.SGLANG_OPT_KDA_VERIFY_GFX950.get()
+        and T == 5
+        and heads == 12
+        and not snap
+        and (batch_size >= 16 or (with_norm and batch_size >= 8))
+    )
+
+
 def kda_verify_gfx950(
     mixed_qkv: torch.Tensor,
     conv_weight: torch.Tensor,
@@ -117,6 +134,9 @@ def kda_verify_gfx950(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    norm_gate: Optional[torch.Tensor] = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-5,
 ) -> torch.Tensor:
     """Returns ``o`` of shape [1, seq_len, HV, V]."""
     snap = intermediate_states_buffer is not None
@@ -129,10 +149,27 @@ def kda_verify_gfx950(
     seq_len = mixed_qkv.shape[0]
     HV, V = num_v_heads, head_v_dim
     batch_size = seq_len // T
-    # measured on MI350X, K3.1 TP8 (T=8): BV=4 wins at B=1, BV=8 from B=4, BV=16 spills
-    bv = 4 if batch_size <= 2 else 8
+    # Baseline T=8 mapping is unchanged. For the new T=5 full-head layout,
+    # 16 waves (BV=8) favour latency, 8 waves (BV=16) favour c64 throughput.
+    optimized = use_full_head_verify(
+        batch_size=batch_size, T=T, heads=HV, snap=snap, with_norm=norm_gate is not None
+    )
+    bv = (8 if batch_size <= 16 else 16) if optimized else (4 if batch_size <= 2 else 8)
+    if norm_gate is not None:
+        assert optimized, "fused norm requires the T=5 full-head ring kernel"
+        assert norm_gate.dtype == torch.bfloat16 and norm_gate.shape == (
+            seq_len,
+            HV * V,
+        )
+        assert norm_gate.stride(1) == 1
+        assert norm_weight is not None and norm_weight.shape == (V,)
+        assert (
+            norm_weight.dtype in (torch.float32, torch.bfloat16)
+            and norm_weight.is_contiguous()
+        )
+        assert norm_gate.device == norm_weight.device == mixed_qkv.device
     o = mixed_qkv.new_empty(seq_len, HV, V)
-    module = _jit_module(bv, T, lower_bound is not None, snap)
+    module = _jit_module(bv, T, lower_bound is not None, snap, optimized)
     module.run(
         _octet_rows(mixed_qkv),
         conv_weight,
@@ -150,6 +187,9 @@ def kda_verify_gfx950(
         replayssm_g,
         replayssm_beta,
         intermediate_states_buffer,
+        norm_gate,
+        norm_weight,
+        float(norm_eps),
         o,
         num_q_heads,
         float(scale),

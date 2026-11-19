@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
@@ -13,7 +12,6 @@ from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
-from sglang.srt.layers.attention.linear.kda_backend_hip import kda_chain_verify_gfx950
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -57,10 +55,9 @@ _RING_CASES += [
 _RING_LEN = 16
 
 
-def _make_ring_buffers(H, HV, K, V):
+def _make_ring_buffers(H, HV, K, V, slots=8):
     # Garbage-filled so a full-tensor bitwise compare proves both that written
     # positions match and that neither kernel scribbles outside them.
-    slots = 8
     return {
         "rawv": torch.randn(
             slots, HV, _RING_LEN, V, device=_DEVICE, dtype=torch.bfloat16
@@ -330,13 +327,17 @@ def _gfx950_case(slots, seed, H=12, T=8):
     inp = _make_inputs(B, T, H, H, 128, 128, 4, False, False, seed, torch.float32)
     inp["cache_indices"] = torch.tensor(slots, device=_DEVICE, dtype=torch.int32)
     inp["win_pool"].normal_()  # untouched window rows must keep their sentinel values
-    rings = _make_ring_buffers(H, H, 128, 128)
+    rings = _make_ring_buffers(H, H, 128, 128, max(8, B + 2))
     args = _fused_args(inp, B, T, H, H, 128, 128, -5.0, None, rings)
     del args["conv_bias"], args["conv_state_indices"]
     return args
 
 
 def _gfx950_srt(args):
+    from sglang.srt.layers.attention.linear.kda_backend_hip import (
+        kda_chain_verify_gfx950,
+    )
+
     layer = SimpleNamespace(
         bias=None,
         conv_weights=args["conv_weight"],
@@ -420,6 +421,138 @@ def test_gfx950_srt_verify_matches_triton_chain_verify():
     torch.testing.assert_close(
         o_new[0][rows].float(), o_ref[0][rows].float(), rtol=2e-2, atol=2e-3
     )
+
+
+def _torch_gfx950_verify(args):
+    """Independent eager FP32 recurrence, including the BF16 conv/output boundaries."""
+    T, H, D = args["T"], args["num_q_heads"], 128
+    B = args["cache_indices"].numel()
+    slots = args["cache_indices"].long().clamp_min(0)
+    x = args["mixed_qkv"].reshape(B, T, 3 * H * D)
+    hist = args["conv_state"].transpose(-1, -2)[slots].float()
+    seq = torch.cat((hist, x.float()), dim=1)
+    w = args["conv_weight"]
+    conv = torch.zeros_like(x, dtype=torch.float32)
+    for i in range(4):
+        conv = conv + seq[:, i : i + T] * w[:, i]
+    conv = (conv * torch.sigmoid(conv)).bfloat16().float()
+    q, k, v = (z.reshape(B, T, H, D) for z in conv.chunk(3, dim=-1))
+    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6) * args["scale"]
+    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+    a = args["a"].reshape(B, T, H, D).float()
+    dt = args["dt_bias"].reshape(H, D)
+    alog = args["A_log"].reshape(H, 1).exp()
+    if args["lower_bound"] is None:
+        g = -alog * torch.nn.functional.softplus(a + dt)
+    else:
+        g = args["lower_bound"] * torch.sigmoid(alog * (a + dt))
+    beta = args["b"].reshape(B, T, H).float().sigmoid()
+    state = args["ssm_states"][slots].clone()
+    outputs = []
+    for t in range(T):
+        state = state * g[:, t].exp().unsqueeze(-2)
+        u = (state * k[:, t].unsqueeze(-2)).sum(-1)
+        delta = (v[:, t] - u) * beta[:, t].unsqueeze(-1)
+        state = state + delta.unsqueeze(-1) * k[:, t].unsqueeze(-2)
+        outputs.append((state * q[:, t].unsqueeze(-2)).sum(-1).bfloat16())
+    return torch.stack(outputs, dim=1).reshape(1, B * T, H, D)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+@pytest.mark.parametrize("batch", [1, 8, 16, 64])
+@pytest.mark.parametrize("norm_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("lower_bound", [-5.0, None, -80.0])
+@pytest.mark.parametrize("seed", [31, 83])
+def test_gfx950_full_head_t5_matches_original_and_torch(
+    batch, norm_dtype, lower_bound, seed, monkeypatch
+):
+    from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import kda_verify_gfx950
+
+    slots = list(reversed(range(1, batch + 1)))
+    if batch > 1:
+        slots[1] = -1
+    old, new = (_gfx950_case(slots, seed=seed, T=5) for _ in range(2))
+    for args in (old, new):
+        args["lower_bound"] = lower_bound
+        # Mimic views of a packed projection rather than only testing dense rows.
+        for name in ("mixed_qkv", "a", "b"):
+            x = args[name]
+            front = torch.empty(
+                x.shape[0], x.shape[-1] + 8, device=x.device, dtype=x.dtype
+            )
+            args[name] = front[:, : x.shape[-1]].copy_(x)
+    # Non-identity scratch rows, as in production.
+    new["intermediate_state_indices"] = old["intermediate_state_indices"] = (
+        torch.arange(batch - 1, -1, -1, device="cuda", dtype=torch.int32)
+    )
+
+    def run(args):
+        return kda_verify_gfx950(**args)
+
+    monkeypatch.setenv("SGLANG_OPT_KDA_VERIFY_GFX950", "0")
+    expected = run(old)
+    oracle = _torch_gfx950_verify(old)
+    rows = (old["cache_indices"] >= 0).repeat_interleave(5)
+    torch.testing.assert_close(
+        expected[0, rows].float(), oracle[0, rows].float(), rtol=2e-2, atol=2e-3
+    )
+    if norm_dtype is not None:
+        gate = torch.randn(
+            batch * 5, 12 * 128 + 8, device="cuda", dtype=torch.bfloat16
+        )[:, : 12 * 128]
+        weight = torch.randn(128, device="cuda", dtype=norm_dtype)
+        new.update(norm_gate=gate, norm_weight=weight, norm_eps=1e-5)
+        xf = expected.float()
+        expected = (
+            (
+                xf
+                * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-5)
+                * weight.float()
+            )
+            * gate.reshape(1, batch * 5, 12, 128).float().sigmoid()
+        ).bfloat16()
+    monkeypatch.setenv("SGLANG_OPT_KDA_VERIFY_GFX950", "1")
+    if batch < 8 and norm_dtype is not None:
+        with pytest.raises(AssertionError, match="fused norm requires"):
+            run(new)
+        return
+    actual = run(new)
+    torch.testing.assert_close(
+        actual[0, rows].float(), expected[0, rows].float(), rtol=2e-2, atol=2e-3
+    )
+    # The accept/rollback path consumes these exact bytes; compare whole pools,
+    # including sentinel rows and tails, not just the verify output.
+    for name in (
+        "conv_state",
+        "ssm_states",
+        "intermediate_conv_window",
+        "replayssm_rawv",
+        "replayssm_rawk",
+        "replayssm_g",
+        "replayssm_beta",
+    ):
+        assert torch.equal(old[name], new[name]), name
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+def test_gfx950_full_head_snapshot_falls_back(monkeypatch):
+    from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import kda_verify_gfx950
+
+    args = _gfx950_case([3, -1, 1], seed=93, T=5)
+    args["cache_ring"] = False
+    for name in ("replayssm_rawv", "replayssm_rawk", "replayssm_g", "replayssm_beta"):
+        args[name] = None
+    args["intermediate_states_buffer"] = torch.empty(3, 5, 12, 128, 128, device="cuda")
+    args["intermediate_states_buffer"].fill_(17)
+    monkeypatch.setenv("SGLANG_OPT_KDA_VERIFY_GFX950", "0")
+    expected = kda_verify_gfx950(**args).clone()
+    snapshot = args["intermediate_states_buffer"].clone()
+    args["intermediate_states_buffer"].fill_(17)
+    monkeypatch.setenv("SGLANG_OPT_KDA_VERIFY_GFX950", "1")
+    actual = kda_verify_gfx950(**args)
+    rows = (args["cache_indices"] >= 0).repeat_interleave(5)
+    assert torch.equal(actual[0, rows], expected[0, rows])
+    assert torch.equal(args["intermediate_states_buffer"], snapshot)
 
 
 if __name__ == "__main__":

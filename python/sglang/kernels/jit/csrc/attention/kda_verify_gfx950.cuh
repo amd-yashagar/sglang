@@ -48,6 +48,11 @@ struct KdaVerifyParams {
   float* __restrict__ ring_g;                  // [slots, HV, L, K]
   float* __restrict__ ring_beta;               // [slots, HV, L]
   float* __restrict__ snap;                    // [rows, steps, HV, V, K]; row = window_indices[i_n]
+  const uint16_t* __restrict__ norm_gate;       // optional [seq_len, H * V] bf16
+  const void* __restrict__ norm_weight;         // optional [V], bf16 or fp32
+  int64_t stride_norm_gate;
+  float norm_eps;
+  bool norm_weight_f32;
   uint16_t* __restrict__ o;                    // [seq_len, HV, V] bf16
   int64_t stride_x_tok;
   int64_t stride_cs_line;
@@ -157,10 +162,15 @@ SGL_DEVICE void conv_octet(const uint4 (&hist)[4], const float4 (&w)[8], float (
   }
 }
 
-// Block = 4 waves sharing one head's state-independent work (phase 1) for 4 * BV value columns;
+// Baseline: 4 waves sharing one head's state-independent work (phase 1) for 4 * BV value columns;
 // each wave then runs the serial recurrence on its own [K, BV] state tile (phase 2).
-template <int kBV, int kT, bool kLowerBound, bool kSnap>
-__global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_constant__ KdaVerifyParams p) {
+// kFullHead: 8/16 waves own all 128 V columns, prepare the head just once,
+// use interleaved float4 state tiles, and optionally consume the output gate.
+template <int kBV, int kT, bool kLowerBound, bool kSnap, bool kFullHead = false>
+__global__ __launch_bounds__(kFullHead ? 8192 / kBV : kBlock) void
+kda_verify_gfx950_kernel(const __grid_constant__ KdaVerifyParams p) {
+  constexpr int kWaves = kFullHead ? 128 / kBV : 4;
+  constexpr int kBlock = kWaves * kWave;
   constexpr int K = kKdaK;
   constexpr int V = kKdaV;
   constexpr int LPC = kWave / kBV;
@@ -169,9 +179,10 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
   constexpr int kVIters = (kCols * kT + kBlock - 1) / kBlock;
   // The gate and the q / k conv map the block onto 8 token groups; groups past kT idle.
   constexpr int kTokenGroups = 8;
-  constexpr int kGateLanes = kBlock / kTokenGroups;  // lanes per token for the gate, kGateRows rows each
+  constexpr int kGateLanes = 256 / kTokenGroups;  // lanes per token for the gate, kGateRows rows each
   constexpr int kGateRows = K / kGateLanes;
-  static_assert(LPC == 4 || LPC == 8 || LPC == 16, "BV must be 4, 8 or 16");
+  static_assert(LPC == 4 || LPC == 8 || LPC == 16);
+  static_assert(!kFullHead || (!kSnap && kCols == V), "full-head variant requires the ring");
   static_assert(kT >= 1 && kT <= kTokenGroups, "T must be 1..8");
   static_assert(kGateRows * kGateLanes == K && kGateRows % 2 == 0, "unsupported gate mapping");
 
@@ -180,6 +191,7 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
   __shared__ float s_decay[kT][K];
   __shared__ float s_v[kT][kCols];
   __shared__ float s_beta[kT];
+  __shared__ float s_out[kFullHead ? kT : 1][kFullHead ? V : 1];
 
   const int tid = threadIdx.x;
   const int wave = tid / kWave;
@@ -195,150 +207,237 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
   const int widx = p.window_indices[i_n];
   const uint16_t* cs = p.conv_state + static_cast<int64_t>(slot) * p.stride_cs_line;
 
-  // ---- global loads, all issued before the first global store (on CDNA vmcnt also counts
-  // stores, so a load behind a store waits for its acknowledgement) ----
+  // Baseline prefetches state before the first global store (CDNA vmcnt also
+  // counts stores). Full-head preparation instead separates register lifetimes
+  // and defers the state load until after conv/gate preparation below.
   const int c = lane / LPC;
   const int j = lane % LPC;
   const int col = i_v * kCols + wave * kBV + c;
   const int r0 = j * KR;
+  // Interleave float4 chunks across the K lanes: adjacent lanes now fetch
+  // adjacent 16-byte segments and address distinct LDS banks.
+  const auto row_at = [=] __device__(int i) {
+    return kFullHead ? j * 4 + (i / 4) * LPC * 4 + i % 4 : r0 + i;
+  };
   float h[KR];
   const float* hp =
-      p.state + static_cast<int64_t>(slot) * p.stride_state_slot + (static_cast<int64_t>(hv) * V + col) * K + r0;
+      p.state + static_cast<int64_t>(slot) * p.stride_state_slot + (static_cast<int64_t>(hv) * V + col) * K;
+  if constexpr (!kFullHead) {
 #pragma unroll
-  for (int i = 0; i < KR; i += 4) {
-    const float4 v4 = device::load_as<float4>(hp + i);
-    h[i] = v4.x;
-    h[i + 1] = v4.y;
-    h[i + 2] = v4.z;
-    h[i + 3] = v4.w;
+    for (int i = 0; i < KR; i += 4) {
+      const float4 v4 = device::load_as<float4>(hp + row_at(i));
+      h[i] = v4.x;
+      h[i + 1] = v4.y;
+      h[i + 2] = v4.z;
+      h[i + 3] = v4.w;
+    }
   }
 
-  // q / k conv: DPP row r (16 lanes x 8 channels = one head) takes token r % 8 of q (r < 8) or k.
-  const int row = tid >> 4;
-  const int conv_t = min(row & 7, kT - 1);
-  const bool conv_valid = (row & 7) < kT;
-  const bool is_k = row >= 8;
-  const int c8 = (tid & 15) * 8;
-  const int64_t cch = (is_k ? static_cast<int64_t>(H) * K : 0) + static_cast<int64_t>(hv) * K + c8;
-  uint4 hist[4];
+  if constexpr (kFullHead) {
+    // Each preparation phase has a separate register lifetime. Only the first
+    // four waves prepare Q/K; remaining waves do not replicate that work.
+    if (tid < 256 && (tid / 16 % 8) < kT) {
+      const int t = tid / 16 % 8;
+      const bool is_k = tid >= 128;
+      const int c8 = tid % 16 * 8;
+      const int64_t ch = (is_k ? static_cast<int64_t>(H) * K : 0) + hv * K + c8;
+      uint4 hist[4];
+      float4 w[8];
 #pragma unroll
-  for (int i = 0; i < 4; ++i)
-    hist[i] = device::load_as<uint4>(seq_ptr(p, cs, bos, conv_t + i, cch));
-  float4 w[8];
+      for (int i = 0; i < 4; ++i) hist[i] = device::load_as<uint4>(seq_ptr(p, cs, bos, t + i, ch));
 #pragma unroll
-  for (int i = 0; i < 8; ++i)
-    w[i] = device::load_as<float4>(p.conv_w + (cch + i) * 4);
-
-  // gate: token tid / kGateLanes, K rows [g0, g0 + kGateRows)
-  const int gate_t = min(tid / kGateLanes, kT - 1);
-  const bool gate_valid = tid / kGateLanes < kT;
-  const int g0 = (tid % kGateLanes) * kGateRows;
-  uint32_t a_raw[kGateRows / 2];
-  float dt[kGateRows];
+      for (int i = 0; i < 8; ++i) w[i] = device::load_as<float4>(p.conv_w + (ch + i) * 4);
+      float y[8];
+      conv_octet(hist, w, y);
+      float ss = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kGateRows; i += 2) {
-    a_raw[i / 2] = device::load_as<uint32_t>(p.a + (bos + gate_t) * p.stride_a_tok + hv * K + g0 + i);
-    const float2 d = device::load_as<float2>(p.dt_bias + hv * K + g0 + i);
-    dt[i] = d.x;
-    dt[i + 1] = d.y;
-  }
-  const float a_log = p.A_log[hv];
-  const float b_raw = bf16_to_f32(p.b[(bos + min(tid, kT - 1)) * p.stride_b_tok + hv]);
-
-  // v conv: one (column, token) per lane and iteration
-  uint16_t v_hist[kVIters][4];
-  float4 wv[kVIters];
+      for (int i = 0; i < 8; ++i) ss += y[i] * y[i];
+      const float rn = (1.0f / sqrtf(group_sum<16>(ss) + 1e-6f)) * (is_k ? 1.0f : p.scale);
+      float* dst = is_k ? &s_k[t][c8] : &s_q[t][c8];
 #pragma unroll
-  for (int it = 0; it < kVIters; ++it) {
-    const int idx = min(tid + it * kBlock, kCols * kT - 1);
-    const int64_t vc = 2LL * H * K + static_cast<int64_t>(hv) * V + i_v * kCols + idx % kCols;
+      for (int i = 0; i < 8; ++i) dst[i] = y[i] * rn;
+      if (widx >= 0) {
+        uint16_t* wp = p.window + widx * p.stride_iw_line + t * p.stride_iw_step + ch;
+#pragma unroll
+        for (int i = 0; i < 3; ++i) device::store_as<uint4>(wp + i * p.stride_iw_win, hist[i + 1]);
+      }
+      if (is_k && t < p.ring_len)
+        device::store_as<uint4>(p.rawk + slot * p.stride_rawk_slot + (hv * p.ring_len + t) * K + c8, pack_bf16x8(y));
+    }
+    for (int idx = tid; idx < kT * K; idx += kBlock) {
+      const int t = idx / K, r = idx % K;
+      const float a = bf16_to_f32(p.a[(bos + t) * p.stride_a_tok + hv * K + r]);
+      const float g = kda_gate<kLowerBound>(a, p.dt_bias[hv * K + r], __expf(p.A_log[hv]), p);
+      s_decay[t][r] = __expf(g);
+      if (t < p.ring_len) p.ring_g[slot * p.stride_g_slot + (hv * p.ring_len + t) * K + r] = g;
+    }
+    if (tid < kT) {
+      const float beta = sigmoid(bf16_to_f32(p.b[(bos + tid) * p.stride_b_tok + hv]));
+      s_beta[tid] = beta;
+      if (tid < p.ring_len) p.ring_beta[slot * p.stride_beta_slot + hv * p.ring_len + tid] = beta;
+    }
+    if (tid < kT * (V / 8)) {
+      const int t = tid / (V / 8), v = tid % (V / 8) * 8;
+      const int64_t ch = 2LL * H * K + hv * V + v;
+      uint4 hist[4];
+      float4 w[8];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) hist[i] = device::load_as<uint4>(seq_ptr(p, cs, bos, t + i, ch));
+#pragma unroll
+      for (int i = 0; i < 8; ++i) w[i] = device::load_as<float4>(p.conv_w + (ch + i) * 4);
+      float y[8];
+      conv_octet(hist, w, y);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) s_v[t][v + i] = y[i];
+      if (widx >= 0) {
+        uint16_t* wp = p.window + widx * p.stride_iw_line + t * p.stride_iw_step + ch;
+#pragma unroll
+        for (int i = 0; i < 3; ++i) device::store_as<uint4>(wp + i * p.stride_iw_win, hist[i + 1]);
+      }
+      if (t < p.ring_len)
+        device::store_as<uint4>(p.rawv + slot * p.stride_rawv_slot + (hv * p.ring_len + t) * V + v, pack_bf16x8(y));
+    }
+    __syncthreads();
+  } else {
+    // q / k conv: DPP row r (16 lanes x 8 channels = one head) takes token r % 8 of q (r < 8) or k.
+    const int row = tid >> 4;
+    const int conv_t = min(row & 7, kT - 1);
+    const bool conv_valid = tid < 256 && (row & 7) < kT;
+    const bool is_k = row >= 8;
+    const int c8 = (tid & 15) * 8;
+    const int64_t cch = (is_k ? static_cast<int64_t>(H) * K : 0) + static_cast<int64_t>(hv) * K + c8;
+    uint4 hist[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      v_hist[it][i] = *seq_ptr(p, cs, bos, idx / kCols + i, vc);
-    wv[it] = device::load_as<float4>(p.conv_w + vc * 4);
-  }
-  asm volatile("" ::: "memory");  // keep every load above ahead of the compute and stores below
+      hist[i] = device::load_as<uint4>(seq_ptr(p, cs, bos, conv_t + i, cch));
+    float4 w[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      w[i] = device::load_as<float4>(p.conv_w + (cch + i) * 4);
 
-  // ---- phase 1: state-independent work for all T tokens ----
-  float y[8];
-  conv_octet(hist, w, y);
-  float ss = 0.0f;
+    // gate: token tid / kGateLanes, K rows [g0, g0 + kGateRows)
+    const int gate_t = min(tid / kGateLanes, kT - 1);
+    const bool gate_valid = tid / kGateLanes < kT;
+    const int g0 = (tid % kGateLanes) * kGateRows;
+    uint32_t a_raw[kGateRows / 2];
+    float dt[kGateRows];
 #pragma unroll
-  for (int i = 0; i < 8; ++i)
-    ss += y[i] * y[i];
-  const float rn = (1.0f / sqrtf(group_sum<16>(ss) + 1e-6f)) * (is_k ? 1.0f : p.scale);
-  if (conv_valid) {
-    float* dst = is_k ? &s_k[conv_t][c8] : &s_q[conv_t][c8];
-    device::store_as<float4>(dst, make_float4(y[0] * rn, y[1] * rn, y[2] * rn, y[3] * rn));
-    device::store_as<float4>(dst + 4, make_float4(y[4] * rn, y[5] * rn, y[6] * rn, y[7] * rn));
-  }
-  const float exp_a_log = __expf(a_log);
-  float g[kGateRows];
-#pragma unroll
-  for (int i = 0; i < kGateRows; ++i) {
-    const uint32_t pair = a_raw[i / 2];
-    const float a_i = __uint_as_float((i & 1) ? (pair & 0xffff0000u) : (pair << 16));
-    g[i] = kda_gate<kLowerBound>(a_i, dt[i], exp_a_log, p);
-    if (gate_valid) s_decay[gate_t][g0 + i] = __expf(g[i]);
-  }
-  const float beta = sigmoid(b_raw);
-  if (tid < kT) s_beta[tid] = beta;
-  uint16_t v_out[kVIters];
-#pragma unroll
-  for (int it = 0; it < kVIters; ++it) {
-    const int idx = tid + it * kBlock;
-    const float wi[4] = {wv[it].x, wv[it].y, wv[it].z, wv[it].w};
-    v_out[it] = f32_to_bf16(conv_silu(
-        bf16_to_f32(v_hist[it][0]),
-        bf16_to_f32(v_hist[it][1]),
-        bf16_to_f32(v_hist[it][2]),
-        bf16_to_f32(v_hist[it][3]),
-        wi));
-    if (idx < kCols * kT) s_v[idx / kCols][idx % kCols] = bf16_to_f32(v_out[it]);
-  }
+    for (int i = 0; i < kGateRows; i += 2) {
+      a_raw[i / 2] = device::load_as<uint32_t>(p.a + (bos + gate_t) * p.stride_a_tok + hv * K + g0 + i);
+      const float2 d = device::load_as<float2>(p.dt_bias + hv * K + g0 + i);
+      dt[i] = d.x;
+      dt[i + 1] = d.y;
+    }
+    const float a_log = p.A_log[hv];
+    const float b_raw = bf16_to_f32(p.b[(bos + min(tid, kT - 1)) * p.stride_b_tok + hv]);
 
-  // ---- global stores: conv windows and ReplaySSM ring rows ----
-  uint16_t* iw = p.window + static_cast<int64_t>(widx) * p.stride_iw_line;
-  const int64_t ring_head = static_cast<int64_t>(hv) * p.ring_len;
-  if (owner) {
+    // v conv: one (column, token) per lane and iteration
+    uint16_t v_hist[kVIters][4];
+    float4 wv[kVIters];
+#pragma unroll
+    for (int it = 0; it < kVIters; ++it) {
+      const int idx = min(tid + it * kBlock, kCols * kT - 1);
+      const int64_t vc = 2LL * H * K + static_cast<int64_t>(hv) * V + i_v * kCols + idx % kCols;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        v_hist[it][i] = *seq_ptr(p, cs, bos, idx / kCols + i, vc);
+      wv[it] = device::load_as<float4>(p.conv_w + vc * 4);
+    }
+    asm volatile("" ::: "memory");  // keep every load above ahead of the compute and stores below
+
+    // ---- phase 1: state-independent work for all T tokens ----
+    float y[8];
+    conv_octet(hist, w, y);
+    float ss = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      ss += y[i] * y[i];
+    const float rn = (1.0f / sqrtf(group_sum<16>(ss) + 1e-6f)) * (is_k ? 1.0f : p.scale);
     if (conv_valid) {
-      if (widx >= 0) {
-        uint16_t* wp = iw + conv_t * p.stride_iw_step + cch;
+      float* dst = is_k ? &s_k[conv_t][c8] : &s_q[conv_t][c8];
+      device::store_as<float4>(dst, make_float4(y[0] * rn, y[1] * rn, y[2] * rn, y[3] * rn));
+      device::store_as<float4>(dst + 4, make_float4(y[4] * rn, y[5] * rn, y[6] * rn, y[7] * rn));
+    }
+    const float exp_a_log = __expf(a_log);
+    float g[kGateRows];
 #pragma unroll
-        for (int i = 0; i < 3; ++i)
-          device::store_as<uint4>(wp + i * p.stride_iw_win, hist[i + 1]);
+    for (int i = 0; i < kGateRows; ++i) {
+      const uint32_t pair = a_raw[i / 2];
+      const float a_i = __uint_as_float((i & 1) ? (pair & 0xffff0000u) : (pair << 16));
+      g[i] = kda_gate<kLowerBound>(a_i, dt[i], exp_a_log, p);
+      if (gate_valid) s_decay[gate_t][g0 + i] = __expf(g[i]);
+    }
+    const float beta = sigmoid(b_raw);
+    if (tid < kT) s_beta[tid] = beta;
+    uint16_t v_out[kVIters];
+#pragma unroll
+    for (int it = 0; it < kVIters; ++it) {
+      const int idx = tid + it * kBlock;
+      const float wi[4] = {wv[it].x, wv[it].y, wv[it].z, wv[it].w};
+      v_out[it] = f32_to_bf16(conv_silu(
+          bf16_to_f32(v_hist[it][0]),
+          bf16_to_f32(v_hist[it][1]),
+          bf16_to_f32(v_hist[it][2]),
+          bf16_to_f32(v_hist[it][3]),
+          wi));
+      if (idx < kCols * kT) s_v[idx / kCols][idx % kCols] = bf16_to_f32(v_out[it]);
+    }
+
+    // ---- global stores: conv windows and ReplaySSM ring rows ----
+    uint16_t* iw = p.window + static_cast<int64_t>(widx) * p.stride_iw_line;
+    const int64_t ring_head = static_cast<int64_t>(hv) * p.ring_len;
+    if (owner) {
+      if (conv_valid) {
+        if (widx >= 0) {
+          uint16_t* wp = iw + conv_t * p.stride_iw_step + cch;
+#pragma unroll
+          for (int i = 0; i < 3; ++i)
+            device::store_as<uint4>(wp + i * p.stride_iw_win, hist[i + 1]);
+        }
+        if (is_k && conv_t < p.ring_len) {
+          device::store_as<uint4>(p.rawk + slot * p.stride_rawk_slot + (ring_head + conv_t) * K + c8, pack_bf16x8(y));
+        }
       }
-      if (is_k && conv_t < p.ring_len) {
-        device::store_as<uint4>(p.rawk + slot * p.stride_rawk_slot + (ring_head + conv_t) * K + c8, pack_bf16x8(y));
+      if (gate_valid && gate_t < p.ring_len) {
+        float* gp = p.ring_g + slot * p.stride_g_slot + (ring_head + gate_t) * K + g0;
+#pragma unroll
+        for (int i = 0; i < kGateRows; i += 2)
+          device::store_as<float2>(gp + i, make_float2(g[i], g[i + 1]));
+      }
+      if (tid < kT && tid < p.ring_len) p.ring_beta[slot * p.stride_beta_slot + ring_head + tid] = beta;
+    }
+#pragma unroll
+    for (int it = 0; it < kVIters; ++it) {
+      const int idx = tid + it * kBlock;
+      const int t = idx / kCols;
+      const int vcol = i_v * kCols + idx % kCols;
+      if (idx < kCols * kT) {
+        if (widx >= 0) {
+          uint16_t* wp = iw + t * p.stride_iw_step + 2LL * H * K + static_cast<int64_t>(hv) * V + vcol;
+#pragma unroll
+          for (int i = 0; i < 3; ++i)
+            wp[i * p.stride_iw_win] = v_hist[it][i + 1];
+        }
+        if (t < p.ring_len) p.rawv[slot * p.stride_rawv_slot + (ring_head + t) * V + vcol] = v_out[it];
       }
     }
-    if (gate_valid && gate_t < p.ring_len) {
-      float* gp = p.ring_g + slot * p.stride_g_slot + (ring_head + gate_t) * K + g0;
-#pragma unroll
-      for (int i = 0; i < kGateRows; i += 2)
-        device::store_as<float2>(gp + i, make_float2(g[i], g[i + 1]));
-    }
-    if (tid < kT && tid < p.ring_len) p.ring_beta[slot * p.stride_beta_slot + ring_head + tid] = beta;
+    // LDS visibility only needs lgkmcnt; __syncthreads() would also wait for the ring / window
+    // stores above to be acknowledged.
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
   }
+
+  // Keep the large state tile out of the conv/gate register live ranges.
+  if constexpr (kFullHead) {
 #pragma unroll
-  for (int it = 0; it < kVIters; ++it) {
-    const int idx = tid + it * kBlock;
-    const int t = idx / kCols;
-    const int vcol = i_v * kCols + idx % kCols;
-    if (idx < kCols * kT) {
-      if (widx >= 0) {
-        uint16_t* wp = iw + t * p.stride_iw_step + 2LL * H * K + static_cast<int64_t>(hv) * V + vcol;
-#pragma unroll
-        for (int i = 0; i < 3; ++i)
-          wp[i * p.stride_iw_win] = v_hist[it][i + 1];
-      }
-      if (t < p.ring_len) p.rawv[slot * p.stride_rawv_slot + (ring_head + t) * V + vcol] = v_out[it];
+    for (int i = 0; i < KR; i += 4) {
+      const float4 v4 = device::load_as<float4>(hp + row_at(i));
+      h[i] = v4.x;
+      h[i + 1] = v4.y;
+      h[i + 2] = v4.z;
+      h[i + 3] = v4.w;
     }
   }
-  // LDS visibility only needs lgkmcnt; __syncthreads() would also wait for the ring / window
-  // stores above to be acknowledged.
-  asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-  __builtin_amdgcn_s_barrier();
 
   // ---- phase 2: serial recurrence on this wave's [K, BV] tile ----
   const int vcol_local = wave * kBV + c;
@@ -347,23 +446,26 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
     float u0 = 0.0f, u1 = 0.0f;
 #pragma unroll
     for (int i = 0; i < KR; i += 2) {
-      h[i] *= s_decay[t][r0 + i];
-      h[i + 1] *= s_decay[t][r0 + i + 1];
-      u0 += h[i] * s_k[t][r0 + i];
-      u1 += h[i + 1] * s_k[t][r0 + i + 1];
+      h[i] *= s_decay[t][row_at(i)];
+      h[i + 1] *= s_decay[t][row_at(i + 1)];
+      u0 += h[i] * s_k[t][row_at(i)];
+      u1 += h[i + 1] * s_k[t][row_at(i + 1)];
     }
     const float u = group_sum<LPC>(u0 + u1);
     const float vn = (s_v[t][vcol_local] - u) * s_beta[t];
     float o0 = 0.0f, o1 = 0.0f;
 #pragma unroll
     for (int i = 0; i < KR; i += 2) {
-      h[i] += s_k[t][r0 + i] * vn;
-      h[i + 1] += s_k[t][r0 + i + 1] * vn;
-      o0 += h[i] * s_q[t][r0 + i];
-      o1 += h[i + 1] * s_q[t][r0 + i + 1];
+      h[i] += s_k[t][row_at(i)] * vn;
+      h[i + 1] += s_k[t][row_at(i + 1)] * vn;
+      o0 += h[i] * s_q[t][row_at(i)];
+      o1 += h[i + 1] * s_q[t][row_at(i + 1)];
     }
     const float o_sum = group_sum<LPC>(o0 + o1);
-    if (j == 0) p.o[((bos + t) * H + hv) * V + col] = f32_to_bf16(o_sum);
+    if (j == 0) {
+      if constexpr (kFullHead) s_out[t][col] = bf16_to_f32(f32_to_bf16(o_sum));
+      else p.o[((bos + t) * H + hv) * V + col] = f32_to_bf16(o_sum);
+    }
     if constexpr (kSnap) {
       if (widx >= 0) {
         float* sp =
@@ -374,11 +476,38 @@ __global__ __launch_bounds__(kBlock) void kda_verify_gfx950_kernel(const __grid_
       }
     }
   }
+  if constexpr (kFullHead) {
+    __syncthreads();
+    // Each wave owns one token and two V channels/lane. Full-head ownership
+    // makes the output norm local, with no global scratch or extra launch.
+    for (int t = wave; t < kT; t += kWaves) {
+      const float x0 = s_out[t][lane], x1 = s_out[t][lane + 64];
+      float inv = 1.0f;
+      if (p.norm_gate) {
+        float ss = x0 * x0 + x1 * x1;
+#pragma unroll
+        for (int mask = 32; mask > 0; mask >>= 1) ss += __shfl_xor(ss, mask, 64);
+        inv = rsqrtf(ss / V + p.norm_eps);
+      }
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int v = lane + i * 64;
+        float out = i ? x1 : x0;
+        if (p.norm_gate) {
+          const float w = p.norm_weight_f32 ? static_cast<const float*>(p.norm_weight)[v]
+              : bf16_to_f32(static_cast<const uint16_t*>(p.norm_weight)[v]);
+          const float gate = bf16_to_f32(p.norm_gate[(bos + t) * p.stride_norm_gate + hv * V + v]);
+          out = (out * inv * w) * sigmoid(gate);
+        }
+        p.o[((bos + t) * H + hv) * V + v] = f32_to_bf16(out);
+      }
+    }
+  }
 }
 
 }  // namespace kda_verify_detail
 
-template <int kBV, int kT, bool kLowerBound, bool kSnap>
+template <int kBV, int kT, bool kLowerBound, bool kSnap, bool kFullHead = false>
 struct KdaVerifyGfx950Kernel {
   static void
   run(const tvm::ffi::TensorView x,
@@ -397,6 +526,9 @@ struct KdaVerifyGfx950Kernel {
       const tvm::ffi::TensorView ring_g,
       const tvm::ffi::TensorView ring_beta,
       const tvm::ffi::Optional<tvm::ffi::TensorView> snap,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> norm_gate,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> norm_weight,
+      const double norm_eps,
       const tvm::ffi::TensorView o,
       const int64_t num_heads,
       const double scale,
@@ -432,6 +564,19 @@ struct KdaVerifyGfx950Kernel {
           "snapshots must be [rows, steps >= T, HV, V, K] with contiguous heads");
       RuntimeCheck(rawv.size(2) == 0, "the snapshot variant writes no ring");
     }
+    RuntimeCheck(norm_gate.has_value() == norm_weight.has_value(), "norm requires both gate and weight");
+    if (norm_gate.has_value()) {
+      RuntimeCheck(kFullHead, "norm requires the full-head kernel");
+      const auto ng = norm_gate.value();
+      const auto nw = norm_weight.value();
+      RuntimeCheck(ng.ndim() == 2 && ng.size(0) == seq_len && ng.size(1) == num_heads * kKdaV && ng.stride(1) == 1,
+                   "norm gate must be row-contiguous [seq_len, H * V]");
+      RuntimeCheck(ng.dtype().code == kDLBfloat && ng.dtype().bits == 16, "norm gate must be bf16");
+      RuntimeCheck(nw.ndim() == 1 && nw.size(0) == kKdaV && nw.stride(0) == 1,
+                   "norm weight must be contiguous [V]");
+      RuntimeCheck((nw.dtype().code == kDLBfloat && nw.dtype().bits == 16) ||
+                   (nw.dtype().code == kDLFloat && nw.dtype().bits == 32), "norm weight must be bf16 or fp32");
+    }
     if (batch == 0) return;
     const KdaVerifyParams params{
         .x = static_cast<const uint16_t*>(x.data_ptr()),
@@ -450,6 +595,11 @@ struct KdaVerifyGfx950Kernel {
         .ring_g = static_cast<float*>(ring_g.data_ptr()),
         .ring_beta = static_cast<float*>(ring_beta.data_ptr()),
         .snap = kSnap ? static_cast<float*>(snap.value().data_ptr()) : nullptr,
+        .norm_gate = norm_gate.has_value() ? static_cast<const uint16_t*>(norm_gate.value().data_ptr()) : nullptr,
+        .norm_weight = norm_weight.has_value() ? norm_weight.value().data_ptr() : nullptr,
+        .stride_norm_gate = norm_gate.has_value() ? norm_gate.value().stride(0) : 0,
+        .norm_eps = static_cast<float>(norm_eps),
+        .norm_weight_f32 = norm_weight.has_value() && norm_weight.value().dtype().bits == 32,
         .o = static_cast<uint16_t*>(o.data_ptr()),
         .stride_x_tok = x.stride(0),
         .stride_cs_line = conv_state.stride(0),
@@ -473,8 +623,10 @@ struct KdaVerifyGfx950Kernel {
         .num_heads = static_cast<int32_t>(num_heads),
         .ring_len = static_cast<int32_t>(rawv.size(2)),
     };
+    constexpr int kWaves = kFullHead ? 128 / kBV : 4;
+    constexpr int kBlock = kWaves * kWave;
     const dim3 grid(kKdaV / (kWaves * kBV), static_cast<uint32_t>(batch * num_heads));
-    LaunchKernel(grid, kBlock, x.device())(kda_verify_gfx950_kernel<kBV, kT, kLowerBound, kSnap>, params);
+    LaunchKernel(grid, kBlock, x.device())(kda_verify_gfx950_kernel<kBV, kT, kLowerBound, kSnap, kFullHead>, params);
   }
 };
 

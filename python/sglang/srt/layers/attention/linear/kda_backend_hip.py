@@ -3,10 +3,10 @@
 from typing import Optional
 
 import torch
-
 from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
     kda_verify_gfx950,
     supports_kda_verify_gfx950,
+    use_full_head_verify,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -78,7 +78,27 @@ def kda_chain_verify_gfx950(
     ):
         return None
     print_info_once(f"KDA chain verify: gfx950 HIP kernel, {draft_token_num} tokens")
-    return kda_verify_gfx950(
+    norm_gate = getattr(layer, "_k3_onorm_gate", None)
+    norm_weight = getattr(layer, "_k3_verify_norm_weight", None)
+    fuse_norm = (
+        use_full_head_verify(
+            batch_size=mixed_qkv.shape[0] // draft_token_num,
+            T=draft_token_num,
+            heads=layer.num_v_heads,
+            snap=intermediate_state_cache is not None,
+            with_norm=True,
+        )
+        and norm_gate is not None
+        and norm_gate.dtype == torch.bfloat16
+        and norm_gate.shape == (mixed_qkv.shape[0], layer.num_v_heads * 128)
+        and norm_gate.stride(-1) == 1
+        and norm_weight is not None
+        and norm_weight.shape == (128,)
+        and norm_weight.dtype in (torch.bfloat16, torch.float32)
+        and norm_weight.is_contiguous()
+        and norm_gate.device == norm_weight.device == mixed_qkv.device
+    )
+    out = kda_verify_gfx950(
         mixed_qkv=mixed_qkv,
         conv_weight=layer.conv_weights,
         conv_state=conv_states.transpose(-1, -2),
@@ -98,5 +118,11 @@ def kda_chain_verify_gfx950(
         head_k_dim=layer.head_k_dim,
         head_v_dim=layer.head_v_dim,
         lower_bound=layer.lower_bound,
+        norm_gate=norm_gate if fuse_norm else None,
+        norm_weight=norm_weight if fuse_norm else None,
+        norm_eps=getattr(layer, "_k3_verify_norm_eps", 1e-5),
         **ring_kwargs,
     )
+    if fuse_norm:
+        layer._k3_onorm_consumed = True
+    return out
