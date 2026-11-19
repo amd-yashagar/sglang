@@ -52,7 +52,7 @@ def _draft_verify_prefix_stage1(
     qo_indptr,
     kv_indptr,
     kv_indices,
-    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] bf16
+    Att_Out,  # [BS, H_Q, MAX_N_SPLITS, L_EXT, Dv] fp32
     Att_Lse,  # [BS, H_Q, MAX_N_SPLITS, L_EXT]     fp32
     num_splits,  # launched split count
     stride_qbs,
@@ -207,7 +207,14 @@ def _draft_verify_prefix_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if BF16_DOT:
+                # Preserve the probability residual while keeping BF16 MFMA inputs.
+                p_hi = p.to(v.dtype)
+                p_lo = (p - p_hi.to(tl.float32)).to(v.dtype)
+                acc += tl.dot(p_hi, v)
+                acc += tl.dot(p_lo, v)
+            else:
+                acc += tl.dot(p.to(v.dtype), v)
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
@@ -449,7 +456,7 @@ def _draft_verify_combine_stage2(
 
 
 class DraftVerifyMLA(VerifyMLA):
-    """``VerifyMLA`` for the gfx950 monokernel's DFLASH MLA draft.
+    """``VerifyMLA`` for the gfx950 DFLASH MLA draft.
 
     It serves empty prefixes and a window trimmed from each rail, splits further,
     combines blocks of splits over row tiles, and compiles stage 1 spill-free.
@@ -482,7 +489,7 @@ class DraftVerifyMLA(VerifyMLA):
         pairs = max(bs * self._num_splits(bs) for bs in range(1, max_bs + 1))
         self.att_out = torch.empty(
             pairs * self.h_q * self.l_pad * self.v_head_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
             device=self.device,
         )
         self.att_lse = torch.empty(
@@ -492,7 +499,7 @@ class DraftVerifyMLA(VerifyMLA):
     def _partials(self, bs, num_splits):
         """Views of the flat partials for one launch.
 
-        [bs, H_Q, num_splits, L_PAD, Dv] bf16 and [bs, H_Q, num_splits, L_PAD] fp32."""
+        [bs, H_Q, num_splits, L_PAD, Dv] fp32 and [bs, H_Q, num_splits, L_PAD] fp32."""
         n = bs * self.h_q * num_splits * self.l_pad
         att_out = self.att_out[: n * self.v_head_dim].view(
             bs, self.h_q, num_splits, self.l_pad, self.v_head_dim
@@ -501,7 +508,9 @@ class DraftVerifyMLA(VerifyMLA):
         return att_out, att_lse
 
     def _num_splits(self, bs):
-        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
+        tiles = max(1, bs * self.n_head_blocks)
+        # A larger split budget improved the measured large-batch draft cases.
+        budget = (3 * TARGET_PROGRAMS if tiles >= 128 else TARGET_PROGRAMS) // tiles
         return max(1, min(self.max_splits, budget))
 
     def _run_prefix_kernel(
