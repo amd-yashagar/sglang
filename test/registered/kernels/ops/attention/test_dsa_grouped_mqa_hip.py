@@ -24,7 +24,15 @@ from sglang.kernels.ops.attention.dsa.gfx950_mqa_logits import (
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=30,
+    stage="base-a-jit-kernel-unit",
+    runner_config="amd",
+    disabled=(
+        "requires gfx950, prebuilt grouped_mqa.cu and benchmark/top-k caches; "
+        "AMD CI does not provision these or set SGLANG_DSA_INDEXER_HIP_LIB"
+    ),
+)
 
 
 @pytest.fixture(scope="module")
