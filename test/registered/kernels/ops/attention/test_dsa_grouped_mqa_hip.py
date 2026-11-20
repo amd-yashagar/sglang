@@ -9,17 +9,22 @@ Set SGLANG_JIT_CACHE_DIR to the CPU-prebuilt top-k cache.
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.dsa.gfx950_mqa_logits import (
     gfx950_flydsl_paged_mqa_logits,
     gfx950_paged_mqa_logits,
     use_flydsl_mqa,
     use_grouped_mqa,
 )
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 @pytest.fixture(scope="module")
@@ -329,3 +334,7 @@ def test_flydsl_mqa_empty_and_bad_output(bench, monkeypatch):
         args[i] = args[i][:0]
     monkeypatch.delenv("SGLANG_DSA_INDEXER_HIP_LIB", raising=False)
     assert gfx950_flydsl_paged_mqa_logits(*args).shape == (0, 256)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
